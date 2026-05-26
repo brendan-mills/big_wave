@@ -145,6 +145,20 @@ DETREND_ORDER  = 2                     # polynomial order vs sin(elev) before LS
 P2N_MIN        = 3.0                   # min peak-to-noise ratio to keep retrieval
 
 # ---------------------------------------------------------------------------
+# Windowed observation defaults (for sub-arc / rogue-wave timescale)
+#
+# Per-arc analysis gives ~1 obs/30 min per (sat, signal) — fine for tides,
+# blind to seconds-to-minutes transients. The windowed path slides a window
+# through each arc, emitting one obs per (window, signal). At 5-min window /
+# 60-s stride, expect ~5000–10000 obs/day across all sats.
+# ---------------------------------------------------------------------------
+WINDOW_SEC     = 300                   # window length (s) for Lomb-Scargle
+STRIDE_SEC     = 60                    # window stride (s)
+MIN_WIN_PTS    = 10                    # min valid SNR samples to evaluate a window
+P2N_WIN_MIN    = 2.5                   # lower P2N gate for windows (broader peaks
+                                       # expected vs full-arc)
+
+# ---------------------------------------------------------------------------
 # Plotting — colored by carrier band (so signals on the same wavelength share
 # a color), markered by constellation.
 # ---------------------------------------------------------------------------

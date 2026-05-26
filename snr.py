@@ -221,15 +221,21 @@ def _peak_refine(pgram: np.ndarray, heights: np.ndarray, i: int
 
 
 def estimate_rh_signal(elev_deg: np.ndarray, snr_db: np.ndarray,
-                       signal: c.Signal) -> dict:
-    """Lomb-Scargle peak -> RH for one (arc, signal).
+                       signal: c.Signal, *,
+                       min_pts: int | None = None) -> dict:
+    """Lomb-Scargle peak -> RH for one (arc-slice, signal).
     Returns {'rh': m, 'sigma_rh': m, 'p2n': ratio, 'edge_hit': bool}.
     NaN values when the SNR column is empty or the peak fit fails.
+
+    `min_pts` lets callers (e.g. windowed analysis) override the default
+    per-arc threshold with a smaller value appropriate for short windows.
     """
+    if min_pts is None:
+        min_pts = c.MIN_ARC_PTS
     nan_out = {'rh': np.nan, 'sigma_rh': np.nan, 'p2n': np.nan, 'edge_hit': False}
 
     mask = snr_db > 0
-    if mask.sum() < c.MIN_ARC_PTS:
+    if mask.sum() < min_pts:
         return nan_out
 
     e = elev_deg[mask]
@@ -320,6 +326,143 @@ def process_arcs(snr_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Sub-arc / windowed observations
+#
+# For rogue-wave timescales the full-arc averaging above is too slow
+# (~30 min cadence). The functions below slide a fixed-length window through
+# each arc and run `estimate_rh_signal` per window per signal, producing a
+# long-form observation stream at the seconds-to-minutes timescale required
+# for transient detection.
+# ---------------------------------------------------------------------------
+
+def rolling_rh_per_arc(arc_long_df: pd.DataFrame,
+                        window_sec: float = c.WINDOW_SEC,
+                        stride_sec: float = c.STRIDE_SEC) -> pd.DataFrame:
+    """Slide a window through one arc's per-sample SNR data; run
+    `estimate_rh_signal` on each window for every applicable signal.
+
+    Parameters
+    ----------
+    arc_long_df : per-sample DataFrame for ONE arc (single arc_id), e.g.
+                  `segment_arcs(snr_df).query('arc_id == X')`.
+    window_sec  : window length in seconds.
+    stride_sec  : window stride in seconds.
+
+    Returns long-form DataFrame, one row per (window, signal) with a finite
+    retrieval:
+        t_center_utc, arc_id, sat, constellation, dir, pass_id,
+        signal, snr_col, n_pts_window, elev_center, azim_center,
+        rh, sigma, p2n, edge_hit
+    """
+    if arc_long_df.empty:
+        return pd.DataFrame()
+
+    sat = int(arc_long_df.sat.iloc[0])
+    direction = str(arc_long_df['dir'].iloc[0])
+    pass_id = int(arc_long_df.pass_id.iloc[0])
+    arc_id = int(arc_long_df.arc_id.iloc[0])
+    constellation = c.constellation_for_sat(sat)
+    applicable = c.signals_for_sat(sat)
+    if not applicable:
+        return pd.DataFrame()
+
+    t_min = arc_long_df.time_utc.min()
+    t_max = arc_long_df.time_utc.max()
+    half = pd.Timedelta(seconds=window_sec / 2)
+    stride = pd.Timedelta(seconds=stride_sec)
+
+    # arc too short for even one full window
+    if t_max - t_min < pd.Timedelta(seconds=window_sec):
+        return pd.DataFrame()
+
+    t_centers = pd.date_range(t_min + half, t_max - half, freq=stride)
+
+    out = []
+    # Sort once and pre-extract numpy arrays; use searchsorted for fast
+    # window slicing. (Comparing tz-aware datetime64 via searchsorted needs
+    # both sides in the same naive ns representation.)
+    sorted_df = arc_long_df.sort_values('time_utc')
+    times_ns = sorted_df.time_utc.dt.tz_convert('UTC').dt.tz_localize(None)\
+                       .astype('datetime64[ns]').astype('int64').to_numpy()
+    elev_arr = sorted_df.elev.to_numpy()
+    azim_arr = sorted_df.azim.to_numpy()
+    snr_cols = {sig.snr_col: sorted_df[sig.snr_col].to_numpy()
+                for sig in applicable}
+    half_ns = int(half.total_seconds() * 1e9)
+
+    for t_c in t_centers:
+        t_c_ns = pd.Timestamp(t_c).tz_convert('UTC').tz_localize(None)\
+                                   .to_datetime64().astype('datetime64[ns]')\
+                                   .astype('int64')
+        lo_idx = int(np.searchsorted(times_ns, t_c_ns - half_ns, side='left'))
+        hi_idx = int(np.searchsorted(times_ns, t_c_ns + half_ns, side='right'))
+        n_pts = hi_idx - lo_idx
+        if n_pts < c.MIN_WIN_PTS:
+            continue
+        e = elev_arr[lo_idx:hi_idx]
+        a = azim_arr[lo_idx:hi_idx]
+        elev_center = float(np.median(e))
+        azim_center = float(np.median(a))
+
+        for sig in applicable:
+            res = estimate_rh_signal(
+                e, snr_cols[sig.snr_col][lo_idx:hi_idx], sig,
+                min_pts=c.MIN_WIN_PTS,
+            )
+            if not np.isfinite(res['rh']):
+                continue
+            out.append({
+                't_center_utc':  t_c,
+                'arc_id':        arc_id,
+                'sat':           sat,
+                'constellation': constellation,
+                'dir':           direction,
+                'pass_id':       pass_id,
+                'signal':        sig.name,
+                'snr_col':       sig.snr_col,
+                'n_pts_window':  n_pts,
+                'elev_center':   round(elev_center, 3),
+                'azim_center':   round(azim_center, 2),
+                'rh':            round(float(res['rh']), 4),
+                'sigma':         (round(float(res['sigma_rh']), 4)
+                                  if np.isfinite(res['sigma_rh']) else np.nan),
+                'p2n':           round(float(res['p2n']), 2),
+                'edge_hit':      bool(res['edge_hit']),
+            })
+    return pd.DataFrame(out)
+
+
+def process_arcs_windowed(snr_df: pd.DataFrame,
+                           window_sec: float = c.WINDOW_SEC,
+                           stride_sec: float = c.STRIDE_SEC) -> pd.DataFrame:
+    """End-to-end per-day windowed pipeline: segment + rolling-window
+    multi-signal RH estimation + quality gates.
+
+    Returns long-form DataFrame (one row per surviving window×signal). Use
+    this in place of `process_arcs` when you need sub-arc time resolution
+    (rogue waves, fast tide rate-of-change, etc.). Per-arc analysis is
+    still appropriate for tide tracking — both can coexist.
+    """
+    arcs = segment_arcs(snr_df)
+    if arcs.empty:
+        return pd.DataFrame()
+
+    frames = [rolling_rh_per_arc(g, window_sec=window_sec, stride_sec=stride_sec)
+              for _, g in arcs.groupby('arc_id', sort=True)]
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return pd.DataFrame()
+
+    obs = pd.concat(frames, ignore_index=True)
+
+    # Quality gates: drop windows with low P2N or edge-hit retrievals
+    keep = (obs['p2n'] >= c.P2N_WIN_MIN) & (~obs['edge_hit'])
+    obs = obs[keep].reset_index(drop=True)
+    obs = obs.sort_values(['t_center_utc', 'sat', 'signal']).reset_index(drop=True)
+    return obs
+
+
+# ---------------------------------------------------------------------------
 # Smoke test
 # ---------------------------------------------------------------------------
 
@@ -370,6 +513,27 @@ if __name__ == '__main__':
         line += '  '.join(f'{r:6.3f}±{s*100:>4.1f}cm' if pd.notna(r) else '     —     '
                           for r, s in zip(rhs, sigs))
         print(line)
+
+    # --- Windowed observation pipeline ---
+    print(f'\n=== Windowed observations '
+          f'(window={c.WINDOW_SEC}s, stride={c.STRIDE_SEC}s) ===')
+    import time as _time
+    t0 = _time.perf_counter()
+    obs = process_arcs_windowed(snr)
+    dt = _time.perf_counter() - t0
+    print(f'Built {len(obs):,} windowed obs in {dt:.1f}s')
+    if len(obs):
+        print(f'Time span: {obs.t_center_utc.min()} -> {obs.t_center_utc.max()}')
+        print()
+        print(f'Per-signal counts and median sigma:')
+        for sig in c.ENABLED_SIGNALS:
+            sub = obs[obs.signal == sig.name]
+            if not len(sub):
+                continue
+            print(f'  {sig.name:8s}  n={len(sub):5d}  '
+                  f'median RH={sub.rh.median():.3f}  '
+                  f'median σ={sub.sigma.median()*100:5.1f} cm  '
+                  f'median p2n={sub.p2n.median():.1f}')
 
     # Demonstrate access to per-sample time series within an arc (needed for
     # the streaming/Kalman variant: rolling Lomb-Scargle windows).
