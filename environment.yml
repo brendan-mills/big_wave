@@ -1,0 +1,34 @@
+# Conda environment for SSiSLS.
+#
+# Create:
+#   conda env create -f environment.yml
+#   conda activate gnssir
+#
+# Note on pyarrow: it is installed via pip rather than conda. The conda-forge
+# pyarrow binary on macOS arm64 has a libprotobuf/liborc symbol mismatch that
+# breaks `import pyarrow`; the PyPI wheel works cleanly.
+
+name: gnssir
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python>=3.12
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib-base
+  - xarray
+  - pyproj
+  - pytmd>=3.0      # Greenland tide model loader (OTIS / FES backends)
+  - h5py
+  - netcdf4
+  - jupyterlab
+  - ipykernel
+
+  - pip
+  - pip:
+    - gnssrefl>=4.1
+    - pyarrow>=20      # parquet engine; PyPI only (see note above)
