@@ -15,8 +15,8 @@ pipeline:
 2. Calls gnssrefl's `rinex2snr` (multi-GNSS SP3 orbits) to produce SNR files.
 3. Segments each day's SNR into low-elevation rising/setting arcs.
 4. Runs Lomb-Scargle on each arc against each enabled signal
-   (GPS L1/L2/L5, Galileo E1/E5a/E5b by default) to retrieve a reflector
-   height (RH) with an analytical 1σ uncertainty.
+   (GPS L1/L2/L5, Galileo E1/E5a/E5b, GLONASS G1/G2 by default) to retrieve a
+   reflector height (RH) with an analytical 1σ uncertainty.
 5. Saves one parquet per day, ready for downstream state estimation.
 6. Predicts the local tide from the ESR **Gr1kmTM** Greenland 1 km model
    (via pyTMD) — used as a prior for the future Kalman filter.
@@ -189,13 +189,16 @@ All knobs live in `config.py`:
 - **rinex2snr:** `ORB='gnss3'` (works for 2026 multi-GNSS), `SNR_TYPE=66`
 - **Arc selection:** `AZ_MIN/MAX, EL_MIN/MAX, RH_MIN/MAX, GAP_SEC, MIN_ARC_PTS`
 - **Signal registry:** `ALL_SIGNALS` (12 defined) and `ENABLED_SIGNALS`
-  (6 default — GPS + Galileo CDMA bands). To add a constellation, append
-  to `ENABLED_SIGNALS`.
+  (8 default — GPS L1/L2/L5, Galileo E1/E5a/E5b, GLONASS G1/G2). To add a
+  band/constellation, append to `ENABLED_SIGNALS`.
 - **Quality control:** `P2N_MIN=3.0` (peak-to-noise gate), edge-hit gate
 
-GLONASS is defined but disabled by default — its FDMA frequencies vary
-per satellite (channel offsets from broadcast nav) and would need
-per-PRN wavelength lookup for sub-cm work.
+GLONASS uses nominal channel-0 frequencies (1602.0 MHz / 1246.0 MHz) rather
+than per-satellite channel lookup. This introduces a per-sat RH bias of
+≈3 cm at typical RH — well below the per-window σ floor of ~50 cm and
+washed out by multi-sat consensus binning. For sub-cm research you would
+read channel numbers from a broadcast nav file and compute per-sat
+wavelengths; the current usage doesn't warrant that complexity.
 
 ## Dependencies
 

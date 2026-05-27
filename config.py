@@ -119,6 +119,9 @@ ALL_SIGNALS = (
 ENABLED_SIGNALS = (
     GPS_L1, GPS_L2, GPS_L5,
     GAL_E1, GAL_E5a, GAL_E5b,
+    GLO_G1, GLO_G2,    # nominal channel-0 frequencies — see WARNING above.
+                        # Per-sat FDMA bias is ~3 cm at RH ~9 m, well below
+                        # our per-window σ floor of ~50 cm.
 )
 
 def signals_for_sat(prn: int, signals=ENABLED_SIGNALS) -> tuple[Signal, ...]:
@@ -152,8 +155,12 @@ P2N_MIN        = 3.0                   # min peak-to-noise ratio to keep retriev
 # through each arc, emitting one obs per (window, signal). At 5-min window /
 # 60-s stride, expect ~5000–10000 obs/day across all sats.
 # ---------------------------------------------------------------------------
-WINDOW_SEC     = 300                   # window length (s) for Lomb-Scargle
-STRIDE_SEC     = 60                    # window stride (s)
+WINDOW_SEC     = 180                   # window length (s) for Lomb-Scargle.
+                                       # 180s targets ~30s+ wave events: short
+                                       # enough that a 30s wave is ~17% of the
+                                       # window (not totally averaged out) while
+                                       # still resolving the spectral peak.
+STRIDE_SEC     = 30                    # window stride (s) — finer time resolution
 MIN_WIN_PTS    = 10                    # min valid SNR samples to evaluate a window
 P2N_WIN_MIN    = 2.5                   # lower P2N gate for windows (broader peaks
                                        # expected vs full-arc)

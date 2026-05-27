@@ -1,18 +1,15 @@
-"""Batch driver for the SSiSLS SNR -> per-arc-RH pipeline.
+"""Batch driver for the SSiSLS SNR pipeline (Layer 2).
 
-Layer 2 only: scans an input folder of RINEX files, runs `snr.process_arcs`
-on each day, writes one parquet per day to `config.RESULTS_DIR`. The Kalman
-filter / tide residual / rogue-wave detection are downstream modules that
-consume these parquets.
+Scans an input folder of RINEX files, runs `snr.process_arcs` and
+`snr.process_arcs_windowed` per day, writes one parquet per day under
+`config.RESULTS_DIR/{year}/`. Driven from `main.py`.
 """
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import json
 import re
-import sys
 import time
 from importlib import metadata
 from pathlib import Path
@@ -290,52 +287,6 @@ def write_provenance(year: int, folder: Path, processed: list[int],
     return out
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def _parse_doys(s: str) -> set[int]:
-    """Accept '1,3,5' or '1-31' or '1-10,15,20-25'."""
-    out = set()
-    for part in s.split(','):
-        part = part.strip()
-        if '-' in part:
-            lo, hi = part.split('-')
-            out.update(range(int(lo), int(hi) + 1))
-        elif part:
-            out.add(int(part))
-    return out
-
-
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument('folder', nargs='?', default=str(c.RINEX_DIR),
-                   help=f'RINEX input folder (default: {c.RINEX_DIR})')
-    p.add_argument('-f', '--force', action='store_true',
-                   help='Reprocess days even if parquet already exists')
-    p.add_argument('--fail-fast', action='store_true',
-                   help='Stop on the first day that errors')
-    p.add_argument('--doys', default=None,
-                   help='Restrict to these doys; e.g. "1,3,5" or "1-31"')
-    args = p.parse_args(argv)
-
-    doys = _parse_doys(args.doys) if args.doys else None
-    # Single-year CLI usage — build (year, doy) date_filter for current year
-    import datetime as _dt
-    date_filter = ({(_dt.datetime.now().year, d) for d in doys}
-                   if doys is not None else None)
-    df = process_folder(Path(args.folder), force=args.force,
-                        fail_fast=args.fail_fast, date_filter=date_filter)
-
-    if not df.empty:
-        print(f'\nQuick summary across run:')
-        for sig in c.ENABLED_SIGNALS:
-            col = f'RH_{sig.name}'
-            if col in df.columns:
-                v = df[col].dropna()
-                if len(v):
-                    print(f'  {sig.name:8s}  n={len(v):4d}  '
-                          f'median={v.median():.3f} m  std={v.std():.3f} m')
 
 
 if __name__ == '__main__':

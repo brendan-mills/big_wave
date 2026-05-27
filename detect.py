@@ -33,43 +33,33 @@ import config as c
 class DetectionConfig:
     """Tuning knobs for spatial+temporal anomaly detection.
 
-    Two coherence gates protect against false positives in degraded
-    reflector conditions (sea ice, snow, rough surfaces). In those regimes
-    multiple sats can show same-sign innovations simply because the whole
-    waterway is noisy — coherence asks whether they actually *agree*.
+    Eight knobs total. An event candidate is a time bin where:
+
+      1. ≥ `min_sats_per_bin` sats show |mahal| > `mahal_threshold` innov,
+      2. the same-sign cluster outnumbers the opposite by ≥ 2× (no flag),
+      3. within that cluster, |median_innov|/std > `coherence_ratio_min`
+         (sats agree on the *value*, not just the sign),
+      4. |median_innov| > `min_amplitude_m` (hard floor — "I only care
+         about events at least this big"), AND
+      5. |median_innov| > `snr_min` × `local_noise_m` (rolling 30-min std
+         of innovations) — adaptive to current conditions.
+
+    Adjacent candidate bins within `max_event_gap_sec` merge into one event.
+
+    Defaults are tuned for **detecting waves ≥ ~2 m**: `min_amplitude_m=1.5`
+    + `snr_min=2.0` together effectively require ~2 m+ events. Drop these
+    to broaden the search to smaller events.
     """
     bin_sec:           float = 60.0   # innovation clustering window
-    mahal_threshold:   float = 2.0    # |mahal| flag for individual obs
+    mahal_threshold:   float = 2.5    # |mahal| flag — raised from 2.0 to
+                                      # match wider per-obs σ from 180s windows
     min_sats_per_bin:  int   = 3      # agreeing sats needed to flag a bin
-    min_amplitude_m:   float = 0.60   # bin-median |innov| to flag
+    coherence_ratio_min: float = 2.5  # within-cluster |median|/std must exceed
+    min_amplitude_m:   float = 1.5    # hard floor on |median_innov| (m).
+                                      # Set to 0.0 to disable; raise for
+                                      # wave-class-only detection.
+    snr_min:           float = 2.0    # |innov| > snr × local rolling-std
     max_event_gap_sec: float = 120.0  # gap that merges adjacent candidate bins
-    require_same_sign: bool  = True   # reject mixed-sign clusters
-
-    # --- coherence / noise-robustness gates ---
-    bin_noise_max_m:     float = 0.40   # max std of *all* in-bin innov (m) —
-                                        # rejects bins where sats disagree
-                                        # wildly across signs (chaotic noise)
-    coherence_ratio_min: float = 2.5    # within the same-sign cluster, the
-                                        # ratio |median_innov| / std_innov must
-                                        # exceed this. Real events have low
-                                        # within-cluster std (sats agree on
-                                        # the value, not just the sign).
-    # --- adaptive local-noise gate ---
-    # The "is this a noisy moment?" test is now relative to the whole run.
-    # Baseline = percentile of `local_noise_m` over all obs in the dataset.
-    # A bin is rejected when its local_noise exceeds `rel_factor × baseline`.
-    # This auto-adjusts season-to-season: summer's natural ~0.7 m floor sets
-    # a different threshold than winter ice's ~1.4 m floor, but the relative
-    # rule "more than 1.5× the typical scatter" works for both.
-    local_noise_pct:        float = 50.0   # percentile for baseline (median)
-    local_noise_rel_factor: float = 1.5    # bin noise must be ≤ this × baseline
-    local_noise_abs_max_m:  float = 2.0    # absolute safety ceiling on the
-                                            # adaptive threshold (m)
-    snr_min:             float = 2.0    # event amplitude must exceed this
-                                        # multiple of the local background
-                                        # noise level. Adaptive: detection
-                                        # gets stricter when conditions are
-                                        # noisy, looser in clean water.
     antenna_msl_m:     float = c.ANTENNA_MSL_M
 
 
@@ -148,10 +138,9 @@ def compute_innovations(obs_df: pd.DataFrame,
 
 def _bin_anomalies(innov_df: pd.DataFrame, config: DetectionConfig
                    ) -> pd.DataFrame:
-    """Aggregate anomalous obs into time bins.
+    """Aggregate anomalous obs into time bins, applying the four event gates.
 
-    Within each bin, counts how many distinct sats reported anomalous
-    same-sign innovations. Returns one row per bin with coherence stats.
+    Returns one row per surviving candidate bin.
     """
     bin_freq = f'{int(config.bin_sec)}s'
     bin_td = pd.Timedelta(seconds=config.bin_sec)
@@ -163,91 +152,64 @@ def _bin_anomalies(innov_df: pd.DataFrame, config: DetectionConfig
     if anom.empty:
         return pd.DataFrame()
 
-    # Adaptive local-noise threshold derived from the full run's distribution.
-    # Compute once outside the loop.
-    noise_series = innov_df.loc[innov_df['in_state_range'], 'local_noise_m']
-    noise_series = noise_series.dropna()
-    if len(noise_series):
-        baseline = float(np.nanpercentile(noise_series, config.local_noise_pct))
-        noise_threshold = min(config.local_noise_rel_factor * baseline,
-                              config.local_noise_abs_max_m)
-        print(f'  [detect] local_noise baseline (p{config.local_noise_pct:.0f}) '
-              f'= {baseline*100:.0f} cm → threshold = {noise_threshold*100:.0f} cm')
-    else:
-        noise_threshold = float('inf')
-
     anom['_bin_start'] = anom['t_center_utc'].dt.floor(bin_freq)
     anom['_sign']      = np.sign(anom['innov']).astype(int)
 
     rows = []
     for bin_start, group in anom.groupby('_bin_start', sort=True):
-        # Counts split by sign (so we can require same-sign agreement)
         pos = group[group['_sign'] > 0]
         neg = group[group['_sign'] < 0]
-        n_sats_pos = pos['sat'].nunique()
-        n_sats_neg = neg['sat'].nunique()
+        n_pos, n_neg = pos['sat'].nunique(), neg['sat'].nunique()
 
-        # Pick the dominant sign (or skip if tied / require_same_sign mixed)
-        if n_sats_pos > n_sats_neg:
-            dominant = pos
-            sign = +1
-            n_sats = n_sats_pos
-            n_other = n_sats_neg
-        elif n_sats_neg > n_sats_pos:
-            dominant = neg
-            sign = -1
-            n_sats = n_sats_neg
-            n_other = n_sats_pos
+        # Gate 1: a clearly dominant sign cluster (≥ 2× the opposite, and
+        # opposite must have less than half the dominant)
+        if n_pos >= 2 * max(n_neg, 1) and n_pos > n_neg:
+            dominant, sign, n_sats = pos, +1, n_pos
+        elif n_neg >= 2 * max(n_pos, 1) and n_neg > n_pos:
+            dominant, sign, n_sats = neg, -1, n_neg
         else:
-            continue  # tied — not coherent
-
-        if config.require_same_sign and n_other > 0:
-            # there are obs of the opposite sign too — possibly noise
-            # but allow if dominant is overwhelming (≥ 3× the other side)
-            if n_sats < 3 * n_other:
-                continue
-
-        median_innov = float(dominant['innov'].median())
-        if abs(median_innov) < config.min_amplitude_m:
             continue
+
+        # Gate 2: need enough sats in the dominant cluster
         if n_sats < config.min_sats_per_bin:
             continue
 
-        # --- noise / coherence gates: protect against chaotic sea-ice etc. ---
-        bin_noise_std = float(group['innov'].std(ddof=0)) if len(group) > 1 else 0.0
-        if bin_noise_std > config.bin_noise_max_m:
-            continue   # whole bin is just noisy — sats disagree wildly
+        median_innov = float(dominant['innov'].median())
 
-        dom_std = float(dominant['innov'].std(ddof=0)) if len(dominant) > 1 else 0.0
-        if dom_std > 0:
-            coherence_ratio = abs(median_innov) / dom_std
-            if coherence_ratio < config.coherence_ratio_min:
-                continue   # same-sign sats don't agree on the value
+        # Gate 3a: hard amplitude floor — "only care about events ≥ this size"
+        if abs(median_innov) < config.min_amplitude_m:
+            continue
+
+        # Gate 3: sats must agree on the *value*, not just the sign
+        if len(dominant) > 1:
+            dom_std = float(dominant['innov'].std(ddof=0))
+            if dom_std > 0:
+                coherence_ratio = abs(median_innov) / dom_std
+                if coherence_ratio < config.coherence_ratio_min:
+                    continue
+            else:
+                coherence_ratio = float('inf')
         else:
             coherence_ratio = float('inf')
 
-        # Local background noise: rolling std of innovations in ±15 min
+        # Gate 4: signal-to-noise vs the rolling background — the only
+        # adaptive piece. local_noise is the ±15-min innov std at this bin.
         local_noise = float(group['local_noise_m'].median())
         if not np.isfinite(local_noise):
             local_noise = 0.0
-        # Adaptive gate: bin must be quieter than `factor × baseline`
-        if local_noise > noise_threshold:
-            continue
-        # SNR: event must clearly stand above local background
-        if local_noise > 0 and abs(median_innov) / local_noise < config.snr_min:
+        if local_noise > 0 and abs(median_innov) < config.snr_min * local_noise:
             continue
 
         rows.append({
             't_bin_start':    bin_start,
             't_bin_center':   bin_start + bin_td / 2,
-            'n_sats_pos':     int(n_sats_pos),
-            'n_sats_neg':     int(n_sats_neg),
+            'n_sats_pos':     int(n_pos),
+            'n_sats_neg':     int(n_neg),
             'n_sats':         int(n_sats),
             'n_obs':          int(len(dominant)),
             'sign':           int(sign),
             'median_innov':   median_innov,
             'max_abs_mahal':  float(dominant['mahal'].abs().max()),
-            'bin_noise_std':  bin_noise_std,
             'coherence_ratio': coherence_ratio,
             'local_noise_m':  local_noise,
             'snr':            (abs(median_innov) / local_noise
