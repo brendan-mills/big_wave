@@ -91,15 +91,101 @@ def process_day(year: int, doy: int, *, force: bool = False) -> pd.DataFrame:
     return arcs
 
 
+# ---------------------------------------------------------------------------
+# Windowed-stage caching (per-day, parallels process_day)
+# ---------------------------------------------------------------------------
+
+def windowed_output_path(year: int, doy: int) -> Path:
+    """Per-day windowed-obs parquet:
+    results/{year}/windowed/{doy:03d}_obs.parquet."""
+    return c.RESULTS_DIR / f'{year}' / 'windowed' / f'{doy:03d}_obs.parquet'
+
+
+def process_day_windowed(year: int, doy: int, *, force: bool = False
+                          ) -> pd.DataFrame:
+    """Run snr.process_arcs_windowed for one day and cache to parquet.
+    Returns long-form per-(window, signal) observation DataFrame.
+    Idempotent: re-reads cache when present unless `force=True`."""
+    out = windowed_output_path(year, doy)
+    if out.exists() and not force:
+        return pd.read_parquet(out)
+
+    snr_df = snr.load_snr(year, doy)
+    obs = snr.process_arcs_windowed(snr_df)
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    obs.to_parquet(out, compression='snappy', index=False)
+    return obs
+
+
+def process_folder_windowed(folder: Path, *, force: bool = False,
+                             fail_fast: bool = False,
+                             date_filter: set[tuple[int, int]] | None = None
+                             ) -> pd.DataFrame:
+    """Run process_day_windowed across every RINEX day in `folder`.
+    `date_filter` is a set of (year, doy) tuples; falsy = all discovered.
+    Returns concatenated long-form obs DataFrame."""
+    folder = Path(folder)
+    discovered = discover_rinex(folder)
+    if date_filter is not None:
+        discovered = [(y, d, p) for (y, d, p) in discovered
+                       if (y, d) in date_filter]
+    if not discovered:
+        print(f'No RINEX files matching station {c.STATION} found in {folder}')
+        return pd.DataFrame()
+
+    print(f'Windowed processing {len(discovered)} day(s) from {folder}')
+    frames = []
+    t_total = time.perf_counter()
+    for year, doy, _ in discovered:
+        t0 = time.perf_counter()
+        try:
+            df = process_day_windowed(year, doy, force=force)
+        except Exception as e:
+            print(f'  doy {doy:03d}: ERROR  {type(e).__name__}: {e}')
+            if fail_fast:
+                raise
+            continue
+        elapsed = time.perf_counter() - t0
+        cached = '   (cached)' if not force and elapsed < 0.05 else ''
+        print(f'  doy {doy:03d}: {len(df):>5d} windowed obs{cached}  {elapsed:5.2f}s')
+        frames.append(df)
+
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    print(f'Done: {len(frames)} days, {len(out):,} obs, '
+          f'{time.perf_counter()-t_total:.1f}s')
+    return out
+
+
+def load_windowed(year: int, doys: list[int] | None = None) -> pd.DataFrame:
+    """Read back per-day windowed parquets; concat across days."""
+    yr_dir = c.RESULTS_DIR / f'{year}' / 'windowed'
+    if not yr_dir.exists():
+        return pd.DataFrame()
+    files = sorted(yr_dir.glob('*_obs.parquet'))
+    if doys is not None:
+        wanted = {f'{d:03d}_obs.parquet' for d in doys}
+        files = [f for f in files if f.name in wanted]
+    if not files:
+        return pd.DataFrame()
+    return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+
 def process_folder(folder: Path, *, force: bool = False, fail_fast: bool = False,
-                   doys: set[int] | None = None) -> pd.DataFrame:
+                   date_filter: set[tuple[int, int]] | None = None
+                   ) -> pd.DataFrame:
     """Process every RINEX day in `folder`. One-line status per day.
+
+    `date_filter` is a set of (year, doy) tuples to restrict processing.
+    Falsy = process every discovered RINEX in the folder.
+
     Returns concatenated DataFrame of all arcs across days.
     """
     folder = Path(folder)
     discovered = discover_rinex(folder)
-    if doys is not None:
-        discovered = [(y, d, p) for (y, d, p) in discovered if d in doys]
+    if date_filter is not None:
+        discovered = [(y, d, p) for (y, d, p) in discovered
+                       if (y, d) in date_filter]
 
     if not discovered:
         print(f'No RINEX files matching station {c.STATION} found in {folder}')
@@ -234,8 +320,12 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     doys = _parse_doys(args.doys) if args.doys else None
+    # Single-year CLI usage — build (year, doy) date_filter for current year
+    import datetime as _dt
+    date_filter = ({(_dt.datetime.now().year, d) for d in doys}
+                   if doys is not None else None)
     df = process_folder(Path(args.folder), force=args.force,
-                        fail_fast=args.fail_fast, doys=doys)
+                        fail_fast=args.fail_fast, date_filter=date_filter)
 
     if not df.empty:
         print(f'\nQuick summary across run:')

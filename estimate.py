@@ -22,6 +22,17 @@ import pandas as pd
 import config as c
 
 
+def _sibling(out_path: Path, key: str, replacement: str) -> Path:
+    """Return a sibling parquet whose name swaps `key` for `replacement` in
+    the stem. Works for both `state.parquet -> gated.parquet` (whole-stem)
+    and `001-031_state.parquet -> 001-031_gated.parquet` (suffix-pattern)."""
+    new_stem = out_path.stem.replace(key, replacement)
+    if new_stem == out_path.stem:
+        # `key` not present — fall back to a sibling next to it
+        new_stem = replacement
+    return out_path.with_name(new_stem + out_path.suffix)
+
+
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
@@ -442,10 +453,8 @@ def run_batch_windowed(obs_df: pd.DataFrame, tide_model, *,
         save_to.parent.mkdir(parents=True, exist_ok=True)
         state.to_parquet(save_to, compression='snappy', index=False)
         if not gated_df.empty:
-            gated_path = save_to.with_name(
-                save_to.stem.replace('_state', '_gated') + '.parquet'
-            )
-            gated_df.to_parquet(gated_path, compression='snappy', index=False)
+            gated_df.to_parquet(_sibling(save_to, 'state', 'gated'),
+                                compression='snappy', index=False)
     return state, gated_df
 
 
@@ -534,10 +543,8 @@ def run_batch_per_arc(arcs_df: pd.DataFrame, tide_model, *,
         save_to.parent.mkdir(parents=True, exist_ok=True)
         state.to_parquet(save_to, compression='snappy', index=False)
         if not gated_df.empty:
-            gated_path = save_to.with_name(
-                save_to.stem.replace('_state', '_gated') + '.parquet'
-            )
-            gated_df.to_parquet(gated_path, compression='snappy', index=False)
+            gated_df.to_parquet(_sibling(save_to, 'state', 'gated'),
+                                compression='snappy', index=False)
     return state, gated_df
 
 

@@ -16,7 +16,7 @@ from pathlib import Path
 STATION = 'umnq'                       # 4-char gnssrefl/RINEX station ID
 LAT, LON = 70.677526, -52.115415       # WGS-84 deg
 ANT_HEIGHT_ELL = 38.00                 # antenna ellipsoidal height, m
-ANTENNA_MSL_M = 10.88                  # nominal antenna height above MSL, m
+ANTENNA_MSL_M = 8.88                  # nominal antenna height above MSL, m
                                        # (used to convert RH -> water level)
 
 # ---------------------------------------------------------------------------
@@ -26,7 +26,7 @@ ANTENNA_MSL_M = 10.88                  # nominal antenna height above MSL, m
 PROJECT_DIR = Path(__file__).resolve().parent
 DATA_DIR    = PROJECT_DIR / 'data'
 
-RINEX_DIR   = DATA_DIR / 'rinex' / 'umnq-2026001-2026031'   # raw .d.Z files
+RINEX_DIR   = DATA_DIR / 'rinex' / 'umnq-2025085-2026145'   # raw .d.Z files
 REFL_CODE   = DATA_DIR / 'refl_code'                        # gnssrefl $REFL_CODE
 EXE_DIR     = REFL_CODE / 'exe'                             # CRX2RNX, gfzrnx
 ORBITS_DIR  = REFL_CODE / 'orbits'                          # SP3 / nav cache
