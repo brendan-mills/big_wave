@@ -37,13 +37,15 @@ import detect
 # =============================================================================
 
 # (year, doy) inclusive bounds. Either can be None to mean "all available".
+# START_DATE = (2025, 85)            # 2025-03-26
+# END_DATE   = (2026, 145)           # 2026-05-25
 START_DATE = (2025, 85)            # 2025-03-26
-END_DATE   = (2026, 145)           # 2026-05-25
+END_DATE   = (2025, 105)           
 
 RINEX_FOLDER = c.RINEX_DIR         # raw RINEX folder (default from config)
 
-BIN_SEC    = 120.0                 # multi-sat bin width (s)
-FORCE      = False                 # True = reprocess everything (ignore caches)
+BIN_SEC    = 100.0                 # multi-sat bin width (s)
+FORCE      = True                 # True = reprocess everything (ignore caches)
 MAKE_PLOTS = True                  # False to skip stage 6
 
 

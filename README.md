@@ -126,9 +126,9 @@ to point at your folder.
 
 ### 4. Get the Greenland tide model (one-time, only if running tide code)
 
-Download [Gr1kmTM](https://arcticdata.io/catalog/view/doi:10.18739/A2B853K18) from ESR (free with registration) and place at the path
-in `config.TIDE_MODEL_DIR` — by default
-`/Users/brmills/Documents/SSiSLS/Gr1kTM/`. Required files:
+Download [Gr1kmTM](https://arcticdata.io/catalog/view/doi:10.18739/A2B853K18)
+from ESR (free with registration) and place under `data/Gr1kTM/` (the
+default `config.TIDE_MODEL_DIR`). Required files:
 `grid_Gr1kmTM_v1`, `h_Gr1kmTM_v1`, `Model_Gr1kmTM_v1`, `xy_ll_Gr1kmTM.m`.
 
 ## Quick start
@@ -300,10 +300,11 @@ need to call `set_environment` before running anything.
 
 ## Auxiliary data
 
-The Greenland tide model lives outside the project tree:
+The Greenland tide model lives under `data/Gr1kTM/` (gitignored along with
+the rest of `data/`):
 
 ```
-/Users/brmills/Documents/SSiSLS/Gr1kTM/
+data/Gr1kTM/
 ├── grid_Gr1kmTM_v1
 ├── h_Gr1kmTM_v1
 ├── UV_Gr1kmTM_v1

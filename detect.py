@@ -46,20 +46,26 @@ class DetectionConfig:
 
     Adjacent candidate bins within `max_event_gap_sec` merge into one event.
 
-    Defaults are tuned for **detecting waves ≥ ~2 m**: `min_amplitude_m=1.5`
-    + `snr_min=2.0` together effectively require ~2 m+ events. Drop these
-    to broaden the search to smaller events.
+    **Defaults are tuned for iceberg-calving wave trains** — sustained,
+    high-amplitude, mixed-sign oscillatory events lasting 3–20 minutes:
+    `min_amplitude_m=1.0` catches mid-distance calving (sub-meter events
+    from far away are below our noise floor anyway), `max_event_gap_sec=240`
+    keeps multi-minute wave trains as one event instead of fragmenting them.
+    The events table includes `n_sign_flips` so monotonic events (likely
+    artifacts) can be distinguished from oscillatory wave trains.
     """
     bin_sec:           float = 60.0   # innovation clustering window
     mahal_threshold:   float = 2.5    # |mahal| flag — raised from 2.0 to
                                       # match wider per-obs σ from 180s windows
     min_sats_per_bin:  int   = 3      # agreeing sats needed to flag a bin
     coherence_ratio_min: float = 2.5  # within-cluster |median|/std must exceed
-    min_amplitude_m:   float = 1.5    # hard floor on |median_innov| (m).
-                                      # Set to 0.0 to disable; raise for
-                                      # wave-class-only detection.
+    min_amplitude_m:   float = 1.0    # hard floor on |median_innov| (m).
+                                      # 1.0 catches mid-distance calving;
+                                      # raise to ignore smaller events.
     snr_min:           float = 2.0    # |innov| > snr × local rolling-std
-    max_event_gap_sec: float = 120.0  # gap that merges adjacent candidate bins
+    max_event_gap_sec: float = 240.0  # gap that merges adjacent candidate bins
+                                      # — 240s lets multi-minute wave trains
+                                      # stay one event instead of fragmenting.
     antenna_msl_m:     float = c.ANTENNA_MSL_M
 
 
@@ -239,32 +245,46 @@ def _identify_events(bin_stats: pd.DataFrame, config: DetectionConfig
 
     events = []
     for eid, grp in bins.groupby('event_id', sort=True):
-        peak_idx = grp['median_innov'].abs().idxmax()
-        peak = grp.loc[peak_idx]
+        grp_sorted = grp.sort_values('t_bin_start')
+        peak_idx = grp_sorted['median_innov'].abs().idxmax()
+        peak = grp_sorted.loc[peak_idx]
+
+        # Count sign reversals across this event's bins. A wave train
+        # (calving, tsunami, swell group) shows alternating crest/trough
+        # bins → ≥1 flip. A monotonic event (single large rise or fall) has
+        # 0 flips and is more likely to be a noise/multipath artifact.
+        signs = grp_sorted['sign'].to_numpy()
+        n_sign_flips = int((np.diff(signs) != 0).sum()) if len(signs) > 1 else 0
+
         events.append({
             'event_id':    int(eid),
-            't_start_utc': grp['t_bin_start'].min(),
-            't_end_utc':   grp['t_bin_start'].max() + pd.Timedelta(seconds=config.bin_sec),
+            't_start_utc': grp_sorted['t_bin_start'].min(),
+            't_end_utc':   grp_sorted['t_bin_start'].max() + pd.Timedelta(seconds=config.bin_sec),
             't_peak_utc':  peak['t_bin_center'],
-            'duration_sec': float((grp['t_bin_start'].max()
-                                    - grp['t_bin_start'].min()).total_seconds()
+            'duration_sec': float((grp_sorted['t_bin_start'].max()
+                                    - grp_sorted['t_bin_start'].min()).total_seconds()
                                    + config.bin_sec),
-            'n_bins':      int(len(grp)),
+            'n_bins':      int(len(grp_sorted)),
             'amplitude_m': float(peak['median_innov']),
             'direction':   'rise' if peak['sign'] > 0 else 'fall',
-            'n_sats_peak': int(grp['n_sats'].max()),
-            'n_obs_total': int(grp['n_obs'].sum()),
-            'max_mahal':   float(grp['max_abs_mahal'].max()),
+            'n_sign_flips': n_sign_flips,
+            'oscillates':  bool(n_sign_flips >= 1),
+            'n_sats_peak': int(grp_sorted['n_sats'].max()),
+            'n_obs_total': int(grp_sorted['n_obs'].sum()),
+            'max_mahal':   float(grp_sorted['max_abs_mahal'].max()),
         })
 
     ev = pd.DataFrame(events)
     if ev.empty:
         return ev
 
-    # Heuristic confidence score: scales with #sats, #bins, amplitude
+    # Heuristic confidence score: scales with #sats, #bins, amplitude,
+    # and oscillation (wave trains get a 1.5× bonus over monotonic events).
+    osc_bonus = np.where(ev['oscillates'], 1.5, 1.0)
     ev['confidence'] = (ev['n_sats_peak']
                         * np.sqrt(ev['n_bins'])
-                        * np.log10(1.0 + ev['amplitude_m'].abs() * 10.0))
+                        * np.log10(1.0 + ev['amplitude_m'].abs() * 10.0)
+                        * osc_bonus)
     return ev.sort_values('confidence', ascending=False).reset_index(drop=True)
 
 

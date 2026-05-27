@@ -33,8 +33,9 @@ ORBITS_DIR  = REFL_CODE / 'orbits'                          # SP3 / nav cache
 RESULTS_DIR = DATA_DIR / 'results'                          # per-day RH parquet
 PLOTS_DIR   = RESULTS_DIR / 'plots'                         # cross-day plots
 
-# Tide model lives outside the project tree
-TIDE_MODEL_DIR = Path('/Users/brmills/Documents/SSiSLS/Gr1kTM')
+# Tide model lives under data/ (gitignored). Collaborators download the
+# Gr1kmTM files once from ESR and drop them in data/Gr1kTM/.
+TIDE_MODEL_DIR = DATA_DIR / 'Gr1kTM'
 
 # ---------------------------------------------------------------------------
 # rinex2snr
@@ -48,7 +49,13 @@ NOLOOK = True                          # skip remote archive — local files onl
 # ---------------------------------------------------------------------------
 AZ_MIN, AZ_MAX = 30.0, 180.0           # deg, station-specific (fjord-facing wedge)
 EL_MIN, EL_MAX = 5.0, 25.0             # deg, elevation band for Lomb-Scargle
-RH_MIN, RH_MAX = 6.0, 14.0             # m, brackets the ~10.88 m antenna MSL height
+RH_MIN, RH_MAX = 5.0, 12.0             # m. Tide range at UMNQ is ±~1 m (2.27 m
+                                       # peak-to-peak measured for Jan 2026), antenna
+                                       # at 8.88 m MSL → physical RH ≈ 7.5–9.7 m.
+                                       # 5–12 gives ~2 m wave headroom on each side
+                                       # while excluding spectral-artifact peaks
+                                       # at 14–18 m that were producing spurious
+                                       # −6 m "events" in the detection layer.
 MIN_ARC_PTS    = 20                    # drop arcs with fewer SNR points than this
 GAP_SEC        = 1800                  # >30 min gap inside an arc -> split passes
 
@@ -155,7 +162,7 @@ P2N_MIN        = 3.0                   # min peak-to-noise ratio to keep retriev
 # through each arc, emitting one obs per (window, signal). At 5-min window /
 # 60-s stride, expect ~5000–10000 obs/day across all sats.
 # ---------------------------------------------------------------------------
-WINDOW_SEC     = 180                   # window length (s) for Lomb-Scargle.
+WINDOW_SEC     = 200                   # window length (s) for Lomb-Scargle.
                                        # 180s targets ~30s+ wave events: short
                                        # enough that a 30s wave is ~17% of the
                                        # window (not totally averaged out) while
@@ -186,4 +193,4 @@ CONSTELLATION_MARKER = {
     'IRNSS':   'X',
 }
 DIR_MARKER = {'rise': '^', 'set': 'v'}
-DPI = 120
+DPI = 300

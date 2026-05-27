@@ -19,7 +19,14 @@ import pyproj
 import xarray as xr
 
 
-GR1KMTM_DIR = Path('/Users/brmills/Documents/SSiSLS/Gr1kTM')
+# Default tide-model location. Imports from `config` so the project-wide
+# path lives in one place; tide.py can still be used standalone by passing
+# `model_dir=...` to GreenlandTideModel.
+try:
+    from config import TIDE_MODEL_DIR as GR1KMTM_DIR
+except ImportError:
+    # Fallback for standalone use outside the project tree
+    GR1KMTM_DIR = Path('data/Gr1kTM').resolve()
 
 # Polar stereographic projection used by the Gr1kmTM grid (see xy_ll_Gr1kmTM.m)
 _GR1KMTM_CRS = {
@@ -226,10 +233,11 @@ def predict_tide(lat: float, lon: float, times, model_dir: Path = GR1KMTM_DIR) -
 
 
 if __name__ == '__main__':
-    # Smoke test: UMNQ, 2026-01-01 (24 hr window)
+    # Smoke test: UMNQ, one month — characterize the full tidal range
+    # (covers the M2/S2 spring-neap cycle, ~14.8 days)
     UMNQ = dict(lat=70.677526, lon=-52.115415)
     START = '2026-01-01T00:00'
-    END   = '2026-01-02T00:00'
+    END   = '2026-02-01T00:00'
 
     tm = GreenlandTideModel(**UMNQ)
     print(f'Station ({UMNQ["lat"]:.4f}, {UMNQ["lon"]:.4f}) projects to '
@@ -241,13 +249,33 @@ if __name__ == '__main__':
     print(tm.constituent_table().to_string(index=False))
     print()
 
-    series = tm.predict_range(START, END, step_sec=3600)
-    print(f'Hourly tide prediction (m), {START} -> {END}:')
-    for t, v in series.items():
-        print(f'  {t.strftime("%Y-%m-%d %H:%M")}  {v:+.3f}')
+    # One month at 5-minute resolution (~8900 samples)
+    series = tm.predict_range(START, END, step_sec=300)
+    print(f'Tide prediction: {START} -> {END}  ({len(series):,} samples @ 5 min)')
     print()
-    print(f'Range: {series.min():+.3f}  to  {series.max():+.3f}  m  '
-          f'(peak-to-peak {series.max()-series.min():.3f} m)')
+
+    # Range stats
+    hi, lo = float(series.max()), float(series.min())
+    print(f'Total tide range over the month:')
+    print(f'  highest water :  {hi:+.3f}  m  ({series.idxmax().strftime("%Y-%m-%d %H:%M UTC")})')
+    print(f'  lowest  water :  {lo:+.3f}  m  ({series.idxmin().strftime("%Y-%m-%d %H:%M UTC")})')
+    print(f'  peak-to-peak  :  {hi - lo:.3f}  m')
+    print(f'  std (variability) :  {float(series.std()):.3f}  m')
+    print()
+
+    # Spring vs neap envelope — daily |max - min| shows the ~14.8-day cycle.
+    # Drop days with fewer than ~half a day of samples (the END boundary
+    # otherwise contributes a 1-sample, 0-range day).
+    daily = series.resample('1D').agg(['min', 'max', 'count'])
+    daily['range_m'] = daily['max'] - daily['min']
+    expected_per_day = int(86400 / 300)            # 5-min sampling
+    daily = daily[daily['count'] >= expected_per_day // 2]
+    print(f'Daily peak-to-peak range ({len(daily)} full days):')
+    print(f'  spring (largest daily range): {daily.range_m.max():.3f} m on '
+          f'{daily.range_m.idxmax().strftime("%Y-%m-%d")}')
+    print(f'  neap   (smallest daily range): {daily.range_m.min():.3f} m on '
+          f'{daily.range_m.idxmin().strftime("%Y-%m-%d")}')
+    print(f'  mean daily range: {daily.range_m.mean():.3f} m')
 
     # save plots so we can eyeball them after the smoke test
     import matplotlib
@@ -257,8 +285,9 @@ if __name__ == '__main__':
     out_dir.mkdir(parents=True, exist_ok=True)
 
     fig, _ = tm.plot(START, END, step_sec=300)
-    fig.suptitle(f'UMNQ tide — {START[:10]}', y=1.02)
-    fig.savefig(out_dir / 'tide_umnq.png', dpi=120, bbox_inches='tight')
+    fig.suptitle(f'UMNQ tide — {START[:10]} to {END[:10]} '
+                 f'(peak-to-peak {hi-lo:.2f} m)', y=1.02)
+    fig.savefig(out_dir / 'tide_umnq_month.png', dpi=120, bbox_inches='tight')
 
     fig, _ = tm.plot_constituents()
     fig.savefig(out_dir / 'tide_umnq_constituents.png', dpi=120, bbox_inches='tight')
