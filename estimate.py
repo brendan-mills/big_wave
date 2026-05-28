@@ -59,9 +59,16 @@ class TideKalmanConfig:
                                    # track ~30 cm/hr tide rate while smoothing
                                    # bin-to-bin observation scatter
     gate_threshold: float = 9.0    # Mahalanobis² cutoff (~3σ on 1-D innovation)
-    sigma_inflation_m: float = 0.15  # added in quadrature to per-obs sigma —
-                                     # absorbs cross-sat / footprint scatter
-                                     # not captured by per-window Lomb-Scargle σ
+    sigma_inflation_m: float = 0.50  # added in quadrature to per-obs sigma.
+                                     # The formal per-bin σ (~30 cm) undertells
+                                     # actual obs noise — consecutive bins
+                                     # routinely disagree by 50-80 cm due to
+                                     # correlated multipath that's not in the
+                                     # Lomb-Scargle σ. Inflating to 50 cm tells
+                                     # the KF to trust each obs less, which
+                                     # both smooths the state and grows the σ
+                                     # band to honestly reflect per-instant
+                                     # water-level uncertainty.
     init_eta:       float | None = None    # if None, init to first obs y
     init_eta_sigma: float = 1.0    # initial 1σ on η (m) — wide so filter
                                    # doesn't lock onto an early outlier

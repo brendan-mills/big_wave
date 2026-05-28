@@ -37,16 +37,30 @@ import detect
 # =============================================================================
 
 # (year, doy) inclusive bounds. Either can be None to mean "all available".
-# START_DATE = (2025, 85)            # 2025-03-26
-# END_DATE   = (2026, 145)           # 2026-05-25
 START_DATE = (2025, 85)            # 2025-03-26
-END_DATE   = (2025, 105)           
+END_DATE   = (2025, 89)           # 2026-05-25
+# START_DATE = (2025, 250)            # 2025-03-26
+# END_DATE   = (2025, 255)           
 
 RINEX_FOLDER = c.RINEX_DIR         # raw RINEX folder (default from config)
 
 BIN_SEC    = 100.0                 # multi-sat bin width (s)
-FORCE      = True                 # True = reprocess everything (ignore caches)
+FORCE      = False                 # True = reprocess everything (ignore caches)
 MAKE_PLOTS = True                  # False to skip stage 6
+
+# When iterating on detector knobs, nuke just the detection-layer outputs
+# (events / innov / bursts parquets) and any cached plots, then run.
+# Preserves state.parquet (KF / invsnr — expensive to rebuild), binned obs,
+# windowed obs, and per-day caches. Re-run is sub-second for the detector
+# stage and seconds for plots.
+CLEAR_CACHED_RESULTS = True
+
+# Use gnssrefl's invsnr B-spline inversion in place of the custom
+# binning + KF stages (3+4). Stage 2 (windowed obs) still runs because
+# the event/burst detector needs per-obs input. invsnr produces its own
+# smoothed RH(t) trajectory which is shaped into state.parquet by
+# `invsnr_runner.to_state`. See invsnr_runner.py for tuning knobs.
+USE_INVSNR = True
 
 
 # =============================================================================
@@ -103,6 +117,41 @@ def state_path(tag: str)  -> Path:  return range_dir(tag) / 'state.parquet'
 def events_path(tag: str) -> Path:  return range_dir(tag) / 'events.parquet'
 
 
+def _clear_downstream(tag: str) -> None:
+    """Delete the detection-layer parquets (events + innov sidecar) for
+    `tag` plus all plot files. Leaves the state + all upstream caches
+    intact so re-runs only re-do the detector + plots.
+
+    Specifically PRESERVED (so they don't get accidentally nuked):
+      - `state.parquet` (KF or invsnr inversion — expensive to rebuild)
+      - `gated.parquet` (KF gating log — sidecar of state)
+      - `binned.parquet` (multi-sat consensus)
+      - per-day windowed obs and invsnr per-day caches
+
+    `bursts.parquet` is included to clean up legacy files from before
+    the detector overhaul; it's no longer produced.
+    """
+    rdir = range_dir(tag)
+    removed = 0
+    for name in ('events.parquet', 'innov.parquet', 'bursts.parquet'):
+        p = rdir / name
+        if p.exists():
+            p.unlink()
+            removed += 1
+    plot_count = 0
+    if c.PLOTS_DIR.exists():
+        for p in c.PLOTS_DIR.iterdir():
+            if p.is_file():
+                p.unlink(); plot_count += 1
+        ev_plots = c.PLOTS_DIR / 'events'
+        if ev_plots.exists():
+            for p in ev_plots.iterdir():
+                if p.is_file():
+                    p.unlink(); plot_count += 1
+    print(f'[clear] removed {removed} parquet(s) under range/{tag}/, '
+          f'{plot_count} plot file(s)')
+
+
 # =============================================================================
 # Stage drivers
 # =============================================================================
@@ -135,6 +184,40 @@ def stage_bin(tag, obs_df, bin_sec, force):
     return binned
 
 
+def stage_invsnr(tag, date_filter, tide_model, force):
+    """[3+4/6] invsnr B-spline inversion → state.parquet, processed day-by-day.
+
+    Each day's invsnr fit is cached at
+    `data/results/{year}/invsnr/{doy:03d}_state.parquet`; the stitched
+    range-level output goes to the standard `state.parquet`. Multi-year
+    ranges work transparently. Force=True forces both the per-day fits
+    and the range-level stitch to rebuild.
+    """
+    import invsnr_runner
+    out = state_path(tag)
+    if out.exists() and not force:
+        print(f'[3+4/6] invsnr state (cached) {out.relative_to(c.PROJECT_DIR)}')
+        return pd.read_parquet(out), pd.DataFrame()
+
+    if not date_filter:
+        raise SystemExit('USE_INVSNR requires a non-empty date filter.')
+
+    print(f'[3+4/6] Running invsnr day-by-day for {len(date_filter)} day(s)')
+    state = invsnr_runner.run_range(date_filter,
+                                     tide_model=tide_model,
+                                     force=force)
+    if state.empty:
+        print('  invsnr produced no state rows. Stopping.')
+        return state, pd.DataFrame()
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    state.to_parquet(out, compression='snappy', index=False)
+    print(f'  stitched state rows: {len(state):,}  '
+          f'water-level range: {state.water_level_m.min():.2f} -> '
+          f'{state.water_level_m.max():.2f} m')
+    return state, pd.DataFrame()    # no gated obs from invsnr
+
+
 def stage_kalman(tag, binned_obs, tide_model, force):
     """[4/6] KF on binned obs."""
     out = state_path(tag)
@@ -154,23 +237,47 @@ def stage_kalman(tag, binned_obs, tide_model, force):
 
 
 def stage_detect(tag, obs_df, state_df, tide_model, force):
-    """[5/6] Event detection on raw obs vs smoothed state."""
-    out = events_path(tag)
-    if out.exists() and not force:
-        print(f'[5/6] Events        (cached) {out.relative_to(c.PROJECT_DIR)}')
-        return pd.read_parquet(out)
+    """[5/6] Event detection: jumps in state water level OR bursts in obs
+    innovation variance. Both pathways merge into one event log with a
+    `trigger` column ∈ {'jump', 'variance', 'both'}. Returns events_df."""
+    events_out = events_path(tag)
+
+    if events_out.exists() and not force:
+        print(f'[5/6] Events       (cached) {events_out.relative_to(c.PROJECT_DIR)}')
+        return pd.read_parquet(events_out)
+
     print(f'[5/6] Detecting events ({len(obs_df):,} raw obs vs state)')
-    events, _ = detect.detect_events(obs_df, state_df, tide_model, save_to=out)
-    print(f'  {len(events)} candidate event(s) detected')
+    events, _innov = detect.detect_events(obs_df, state_df, tide_model,
+                                           save_to=events_out)
+    if not events.empty:
+        counts = events['trigger'].value_counts().to_dict()
+        breakdown = ', '.join(f'{k}={v}' for k, v in sorted(counts.items()))
+        print(f'  {len(events)} event(s): {breakdown}')
+    else:
+        print('  no events')
     return events
 
 
 def stage_plots():
-    """[6/6] Headline plots — defers to plots.py."""
+    """[6/6] Headline plots.
+
+    When USE_INVSNR=True, calls the dedicated invsnr plot module
+    (`plots_invsnr.generate()`) which builds:
+      - clean overview (raw obs cloud + invsnr + tide)
+      - overview with event & burst windows shaded
+      - per-event zoom plots (top-N by confidence)
+      - per-burst zoom plots (top-N by confidence)
+
+    Otherwise falls back to the legacy `plots.py` (KF-mode workflow).
+    """
     print('\n[6/6] Plots')
-    import subprocess
-    subprocess.run([sys.executable, 'plots.py'], check=True,
-                   cwd=str(c.PROJECT_DIR))
+    if USE_INVSNR:
+        import plots_invsnr
+        plots_invsnr.generate()    # auto-picks most recent tag
+    else:
+        import subprocess
+        subprocess.run([sys.executable, 'plots.py'], check=True,
+                       cwd=str(c.PROJECT_DIR))
 
 
 # =============================================================================
@@ -186,6 +293,9 @@ def run():
     tag = range_tag(date_filter, folder)
     print(f'Range: {tag}  '
           f'({"all" if date_filter is None else len(date_filter)} day(s))')
+
+    if CLEAR_CACHED_RESULTS:
+        _clear_downstream(tag)
 
     t_start = time.perf_counter()
 
@@ -208,18 +318,19 @@ def run():
     print(f'\n--- Range: {tag} '
           f'({n_days} days, {len(windowed):,} obs) ---')
 
-    # Stage 3: multi-sat binning
-    binned = stage_bin(tag, windowed, BIN_SEC, FORCE)
-    if binned.empty:
-        print('No binned obs. Stopping.')
-        return
-
-    # Stage 4: KF (tide model needed)
+    # Stages 3+4 — either custom (binning + KF) OR invsnr B-spline inversion
     from tide import GreenlandTideModel
     tm = GreenlandTideModel(c.LAT, c.LON)
-    state, _ = stage_kalman(tag, binned, tm, FORCE)
+    if USE_INVSNR:
+        state, _ = stage_invsnr(tag, date_filter, tm, FORCE)
+    else:
+        binned = stage_bin(tag, windowed, BIN_SEC, FORCE)
+        if binned.empty:
+            print('No binned obs. Stopping.')
+            return
+        state, _ = stage_kalman(tag, binned, tm, FORCE)
 
-    # Stage 5: event detection
+    # Stage 5: event detection (jump + variance triggers, merged)
     events = stage_detect(tag, windowed, state, tm, FORCE)
 
     # Stage 6: plots
@@ -235,11 +346,15 @@ def run():
     print(f'  windowed obs     : data/results/{{year}}/windowed/{{doy:03d}}_obs.parquet')
     print(f'  range artifacts  : data/results/range/{tag}/')
     print(f'  detected events  : {len(events)}')
+
     if not events.empty:
-        print(f'\n  Top 5 candidate events by confidence:')
-        show = ['t_peak_utc', 'duration_sec', 'amplitude_m', 'direction',
-                'n_sats_peak', 'n_bins', 'confidence']
-        print(events[show].head(5).to_string(index=False))
+        counts = events['trigger'].value_counts().to_dict()
+        breakdown = ', '.join(f'{k}={v}' for k, v in sorted(counts.items()))
+        print(f'  by trigger       : {breakdown}')
+        print(f'\n  Top 5 events by confidence:')
+        show = ['t_peak_utc', 'trigger', 'duration_sec', 'delta_m',
+                'peak_burst_amp_m', 'n_obs_in_window', 'confidence']
+        print(events[show].head(5).round(3).to_string(index=False))
 
 
 if __name__ == '__main__':

@@ -213,11 +213,11 @@ def plot_event_window(event_row: pd.Series,
         wl = event_row.get('water_level_at_peak_m')
         wl_txt = f"  (water level {wl:+.2f} m)" if wl is not None and not pd.isna(wl) else ""
         lines.append(f"Δwater level: {delta:+.2f} m{wl_txt}")
-    pvs = event_row.get('peak_var_std_m')
+    pvs = event_row.get('peak_burst_amp_m')
     if pvs is not None and not pd.isna(pvs):
         n = event_row.get('n_obs_in_window')
         n_txt = f", n_obs={int(n)}" if n is not None and not pd.isna(n) else ""
-        lines.append(f"peak innov σ: {pvs:.2f} m{n_txt}")
+        lines.append(f"straddle amp: ±{pvs:.2f} m{n_txt}")
     if 'confidence' in event_row.index:
         lines.append(f"confidence: {event_row['confidence']:.2f}")
 

@@ -188,6 +188,17 @@ def run_one_day(
     if cache.exists() and not force:
         return pd.read_parquet(cache)
 
+    # gnssrefl's invsnr calls sys.exit() (→ SystemExit) if the snr file is
+    # missing, which would abort the whole batch. Pre-check and raise a normal
+    # exception instead so run_range can skip just this day and continue.
+    yy = year % 100
+    snr_dir = Path(os.environ['REFL_CODE']) / str(year) / 'snr' / station
+    if not list(snr_dir.glob(f'{station}{doy:03d}0.{yy:02d}.snr*')):
+        raise FileNotFoundError(
+            f'no snr file for {station} {year} doy {doy} in {snr_dir} '
+            '(rinex2snr produced none — likely missing/empty RINEX)'
+        )
+
     ensure_config(
         station=station,
         rh_min=c.RH_MIN, rh_max=c.RH_MAX,
@@ -258,7 +269,10 @@ def run_range(
         try:
             ds = run_one_day(year, doy, tide_model=tide_model,
                               force=force, **kwargs)
-        except Exception as e:
+        # invsnr can sys.exit() (SystemExit, not Exception) on bad days;
+        # catch both so one bad day skips instead of killing the batch.
+        # KeyboardInterrupt (BaseException) still propagates.
+        except (Exception, SystemExit) as e:
             print(f'  [{i:>3d}/{len(dates)}] {year}-{doy:03d}: '
                   f'FAILED  {type(e).__name__}: {e}')
             if fail_fast:
