@@ -49,13 +49,16 @@ NOLOOK = True                          # skip remote archive — local files onl
 # ---------------------------------------------------------------------------
 AZ_MIN, AZ_MAX = 30.0, 180.0           # deg, station-specific (fjord-facing wedge)
 EL_MIN, EL_MAX = 5.0, 25.0             # deg, elevation band for Lomb-Scargle
-RH_MIN, RH_MAX = 5.0, 12.0             # m. Tide range at UMNQ is ±~1 m (2.27 m
+RH_MIN, RH_MAX = 4.0, 16.0             # m. Tide range at UMNQ is ±~1 m (2.27 m
                                        # peak-to-peak measured for Jan 2026), antenna
                                        # at 8.88 m MSL → physical RH ≈ 7.5–9.7 m.
-                                       # 5–12 gives ~2 m wave headroom on each side
-                                       # while excluding spectral-artifact peaks
-                                       # at 14–18 m that were producing spurious
-                                       # −6 m "events" in the detection layer.
+                                       # RH_MAX=11 covers up to ~2 m below MSL (deeper
+                                       # than any plausible low tide + surge). Tighter
+                                       # than 12 to stop LS from clamping spurious
+                                       # peaks above 11 to the grid ceiling, which
+                                       # produced "flat negative water level" runs.
+                                       # RH_MIN=5 allows ~3 m wave crests above max
+                                       # tide before bumping the lower edge.
 MIN_ARC_PTS    = 20                    # drop arcs with fewer SNR points than this
 GAP_SEC        = 1800                  # >30 min gap inside an arc -> split passes
 

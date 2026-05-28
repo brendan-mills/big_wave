@@ -266,6 +266,153 @@ def plot_event_window(event_row: pd.Series,
     return fig, ax
 
 
+def plot_water_level_layered(state: pd.DataFrame,
+                              binned: pd.DataFrame,
+                              raw_obs: pd.DataFrame,
+                              tide_series: pd.Series,
+                              *,
+                              ax=None,
+                              bursts: pd.DataFrame | None = None,
+                              antenna_msl: float = c.ANTENNA_MSL_M):
+    """Render the standard water-level overlay with the project's preferred
+    layer order (back → front): raw obs, binned obs (±σ), KF state line,
+    KF ±1σ band, predicted tide. Optionally shade `bursts` time extents.
+
+    Returns (fig, ax). Pass `bursts=None` for the clean view; pass a
+    bursts DataFrame to overlay orange vertical bands at each burst.
+    """
+    import matplotlib.pyplot as plt
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(13, 5))
+    else:
+        fig = ax.figure
+
+    # 1. Raw windowed obs — every individual sat × window measurement
+    if raw_obs is not None and len(raw_obs):
+        ax.scatter(raw_obs.t_center_utc, antenna_msl - raw_obs.rh,
+                   c='0.5', s=3, alpha=0.15, edgecolors='none', zorder=1,
+                   label=f'raw windowed obs (n={len(raw_obs)})')
+
+    # 2. Binned obs — multi-sat consensus the KF actually consumed
+    if binned is not None and len(binned):
+        ax.errorbar(binned.t_center_utc, antenna_msl - binned.rh,
+                    yerr=binned.sigma,
+                    fmt='o', ms=3, mfc='C0', mec='C0',
+                    ecolor='C0', elinewidth=0.5, alpha=0.7, zorder=2,
+                    label=f'binned obs (n={len(binned)})')
+
+    # 3. KF state estimate
+    if len(state):
+        ax.plot(state.t_utc, state.water_level_m,
+                color='C3', lw=1.8, zorder=3,
+                label='KF water-level estimate')
+        # 4. KF ±1σ band (above the line so the band is always visible)
+        ax.fill_between(state.t_utc,
+                        state.water_level_m - state.eta_sigma_m,
+                        state.water_level_m + state.eta_sigma_m,
+                        color='C3', alpha=0.20, lw=0, zorder=4,
+                        label='KF ± 1σ')
+
+    # 5. Predicted tide — overlaid for direct comparison
+    if tide_series is not None and len(tide_series):
+        ax.plot(tide_series.index, tide_series.values,
+                color='0.2', lw=1.2, alpha=0.85, zorder=5,
+                label='Predicted tide (Gr1kmTM)')
+
+    # Optional burst overlay (drawn at zorder=0 so it sits behind everything)
+    if bursts is not None and len(bursts):
+        first = True
+        for _, b in bursts.iterrows():
+            ax.axvspan(b['t_start_utc'], b['t_end_utc'],
+                       color='C1', alpha=0.18, zorder=0,
+                       label='variance burst' if first else None)
+            first = False
+
+    ax.set_ylabel('Water level (m, rel. MSL)')
+    ax.set_xlabel('Time (UTC)')
+    style_time_axis(ax)
+    ax.legend(loc='upper right', fontsize=8, ncol=2)
+    fig.tight_layout()
+    return fig, ax
+
+
+def plot_burst_overview(innov_df: pd.DataFrame,
+                         bursts_df: pd.DataFrame | None = None,
+                         *,
+                         burst_window_sec: float = 300.0,
+                         bg_window_sec: float = 3600.0,
+                         burst_ratio_threshold: float = 2.0,
+                         ax=None):
+    """Variance-burst diagnostic: short- and long-window innovation std
+    over time, with detected bursts shaded.
+
+    The 5-min std (red) spiking above 2× the 60-min std (dashed gray) is
+    the burst condition. Clustering in time of these spikes reveals
+    whether bursts are random (instrument noise / multipath) or correlated
+    with environmental events (e.g., summer calving activity).
+
+    Returns (fig, ax).
+    """
+    import matplotlib.pyplot as plt
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(13, 4))
+    else:
+        fig = ax.figure
+
+    if innov_df is None or innov_df.empty:
+        ax.text(0.5, 0.5, '(no innovations to plot)',
+                ha='center', va='center', transform=ax.transAxes)
+        return fig, ax
+
+    df = innov_df[innov_df['in_state_range']].copy()
+    df = df.sort_values('t_center_utc').set_index('t_center_utc')
+
+    burst_w = f'{int(burst_window_sec)}s'
+    bg_w    = f'{int(bg_window_sec)}s'
+    burst_std = df['innov'].rolling(burst_w, center=True, min_periods=5).std()
+    bg_std    = df['innov'].rolling(bg_w,    center=True, min_periods=20).std()
+    threshold = bg_std * burst_ratio_threshold
+
+    # Fill above-threshold burst regions in the burst trace
+    elevated = burst_std > threshold
+    ax.fill_between(burst_std.index, 0, burst_std,
+                    where=elevated.fillna(False),
+                    color='C3', alpha=0.25, lw=0,
+                    label=f'burst (>{burst_ratio_threshold:g}× background)')
+
+    # Background std (60-min rolling)
+    ax.plot(bg_std.index, bg_std.values,
+            color='0.4', lw=1.4, alpha=0.85,
+            label=f'background std ({int(bg_window_sec/60)}-min)')
+
+    # Threshold = burst_ratio × background, dashed
+    ax.plot(threshold.index, threshold.values,
+            color='0.4', lw=1.0, alpha=0.7, linestyle='--',
+            label=f'threshold ({burst_ratio_threshold:g}× background)')
+
+    # Burst std (short window)
+    ax.plot(burst_std.index, burst_std.values,
+            color='C3', lw=1.0, alpha=0.85,
+            label=f'burst std ({int(burst_window_sec/60)}-min)')
+
+    # Detected-burst extents as faint vertical bands (matches plot 2 colors)
+    if bursts_df is not None and len(bursts_df):
+        first = True
+        for _, b in bursts_df.iterrows():
+            ax.axvspan(b['t_start_utc'], b['t_end_utc'],
+                       color='C1', alpha=0.10, zorder=0,
+                       label=f'{len(bursts_df)} bursts' if first else None)
+            first = False
+
+    ax.set_ylabel('Innovation std (m)')
+    ax.set_xlabel('Time (UTC)')
+    ax.set_ylim(bottom=0)
+    style_time_axis(ax)
+    ax.legend(loc='upper right', fontsize=8, ncol=2)
+    fig.tight_layout()
+    return fig, ax
+
+
 def plot_residual(state_df: pd.DataFrame, *, ax=None):
     """KF η (= water level − predicted tide − offset) over time.
 
@@ -334,25 +481,39 @@ if __name__ == '__main__':
     if not state_path.exists():
         raise SystemExit(f'No KF state at {state_path} — run main.py first.')
 
+    # Load state + binned + events + bursts + innov first so we know the
+    # range's time span and have everything needed for all plot variants.
+    bursts_path = rdir / 'bursts.parquet'
+    innov_path  = rdir / 'innov.parquet'
+    state = pd.read_parquet(state_path)
+    binned = pd.read_parquet(binned_path) if binned_path.exists() else pd.DataFrame()
+    events = pd.read_parquet(events_path) if events_path.exists() else pd.DataFrame()
+    bursts = pd.read_parquet(bursts_path) if bursts_path.exists() else pd.DataFrame()
+    innov  = pd.read_parquet(innov_path)  if innov_path.exists()  else pd.DataFrame()
+
     # Raw windowed obs aren't concatenated into the range dir; load from
-    # the per-day caches under each year folder that the range spans.
+    # the per-day caches under each year folder and **clip to the state's
+    # time bounds** so we don't accidentally plot obs from days the current
+    # KF run didn't include.
+    t_lo, t_hi = state.t_utc.min(), state.t_utc.max()
     raw_obs_frames = []
     for ydir in (c.RESULTS_DIR.iterdir() if c.RESULTS_DIR.exists() else []):
         wdir = ydir / 'windowed'
         if not wdir.is_dir():
             continue
         for per_day in sorted(wdir.glob('[0-9][0-9][0-9]_obs.parquet')):
-            raw_obs_frames.append(pd.read_parquet(per_day))
+            df = pd.read_parquet(per_day, columns=['t_center_utc', 'rh', 'sigma'])
+            df = df[df.t_center_utc.between(t_lo, t_hi)]
+            if len(df):
+                raw_obs_frames.append(df)
     raw_obs = (pd.concat(raw_obs_frames, ignore_index=True)
                if raw_obs_frames else pd.DataFrame())
 
-    state = pd.read_parquet(state_path)
-    binned = pd.read_parquet(binned_path) if binned_path.exists() else pd.DataFrame()
-    events = pd.read_parquet(events_path) if events_path.exists() else pd.DataFrame()
     obs = binned if not binned.empty else raw_obs    # what the KF actually saw
-    print(f'Loaded state: {len(state):,} rows; '
-          f'raw obs: {len(raw_obs):,}; binned obs: {len(binned):,}; '
-          f'events: {len(events):,}')
+    print(f'Loaded state: {len(state):,} rows  '
+          f'({t_lo} -> {t_hi}); '
+          f'raw obs (range-clipped): {len(raw_obs):,}; '
+          f'binned: {len(binned):,}; events: {len(events):,}')
 
     tm = GreenlandTideModel(c.LAT, c.LON)
     t_min, t_max = state.t_utc.min(), state.t_utc.max()
@@ -361,34 +522,28 @@ if __name__ == '__main__':
     out_dir = c.PLOTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plot_water_level(state, arcs_df=None, tide_series=tide)
-
-    # Faint background: raw per-window obs across all sats/bands (so you can
-    # see the underlying scatter the binning compressed)
-    if not raw_obs.empty:
-        ax.scatter(raw_obs.t_center_utc,
-                   c.ANTENNA_MSL_M - raw_obs.rh,
-                   c='0.5', s=3, alpha=0.15, edgecolors='none', zorder=1,
-                   label=f'raw windowed obs (n={len(raw_obs)})')
-
-    # Mid layer: binned obs (what the KF actually consumed)
-    if not binned.empty:
-        ax.errorbar(binned.t_center_utc,
-                    c.ANTENNA_MSL_M - binned.rh,
-                    yerr=binned.sigma,
-                    fmt='o', ms=3, mfc='C0', mec='C0',
-                    ecolor='C0', elinewidth=0.5, alpha=0.7, zorder=2,
-                    label=f'binned obs (n={len(binned)})')
-
-    # Foreground: re-plot the KF state on top so the line is visible above
-    # the obs scatter (plot_water_level draws it underneath by default)
-    ax.plot(state.t_utc, state.water_level_m,
-            color='C3', lw=1.8, zorder=5, label='_nolegend_')
-
-    ax.legend(loc='upper right', fontsize=8, ncol=2)
-    fig.suptitle(f'{c.STATION.upper()} water level (windowed KF, 120s bins) — '
-                 f'range {TAG}', y=1.02)
+    # --- Plot 1: water level (no burst markers, clean view) ---
+    fig, _ = plot_water_level_layered(state, binned, raw_obs, tide)
+    fig.suptitle(f'{c.STATION.upper()} water level (windowed KF) — range {TAG}',
+                 y=1.02)
     out = out_dir / f'water_level_{TAG}.png'
+    fig.savefig(out, dpi=c.DPI, bbox_inches='tight')
+    print(f'wrote {out.relative_to(c.PROJECT_DIR)}')
+
+    # --- Plot 2: water level with burst windows shaded ---
+    fig, _ = plot_water_level_layered(state, binned, raw_obs, tide,
+                                       bursts=bursts)
+    fig.suptitle(f'{c.STATION.upper()} water level + variance bursts — range {TAG}',
+                 y=1.02)
+    out = out_dir / f'water_level_bursts_{TAG}.png'
+    fig.savefig(out, dpi=c.DPI, bbox_inches='tight')
+    print(f'wrote {out.relative_to(c.PROJECT_DIR)}')
+
+    # --- Plot 3: variance-burst overview (short vs long innov std) ---
+    fig, _ = plot_burst_overview(innov, bursts_df=bursts)
+    fig.suptitle(f'{c.STATION.upper()} variance-burst overview — range {TAG}',
+                 y=1.02)
+    out = out_dir / f'bursts_overview_{TAG}.png'
     fig.savefig(out, dpi=c.DPI, bbox_inches='tight')
     print(f'wrote {out.relative_to(c.PROJECT_DIR)}')
 
