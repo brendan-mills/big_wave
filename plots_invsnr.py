@@ -39,8 +39,16 @@ CONSTELLATION_BASE = {
 TRIGGER_COLOR = {
     'jump':     'C1',   # orange
     'variance': 'C4',   # purple
-    'both':     'C3',   # red
+    'surge':    'C5',   # brown
 }
+
+
+def _trigger_color(trigger: str) -> str:
+    """Color for an event by trigger label. '+'-joined multi-trigger events
+    (the most interesting) get red; single triggers get their own hue."""
+    if '+' in str(trigger):
+        return 'C3'     # red — multi-pathway event
+    return TRIGGER_COLOR.get(trigger, 'C7')
 
 
 def _constellation_of(prn: int) -> str:
@@ -159,7 +167,7 @@ def plot_overview(state: pd.DataFrame,
         seen_triggers = set()
         for _, ev in events.iterrows():
             trig = ev.get('trigger', 'jump')
-            color = TRIGGER_COLOR.get(trig, 'C5')
+            color = _trigger_color(trig)
             label = None
             if trig not in seen_triggers:
                 n = int((events['trigger'] == trig).sum())
@@ -184,7 +192,7 @@ def plot_event_window(event_row: pd.Series,
                        hours_each_side: float = 12.0,
                        ax=None):
     """Zoomed water-level plot around one detected event. Annotation
-    adapts to the trigger type ('jump', 'variance', or 'both')."""
+    adapts to the trigger type ('jump', 'variance', 'surge', or combos)."""
     t_peak = pd.Timestamp(event_row['t_peak_utc'])
     half = pd.Timedelta(hours=hours_each_side)
     t_lo, t_hi = t_peak - half, t_peak + half
@@ -197,7 +205,7 @@ def plot_event_window(event_row: pd.Series,
     fig, ax = plot_overview(state_w, raw_w, tide_w, ax=ax)
 
     trig = event_row.get('trigger', 'jump')
-    color = TRIGGER_COLOR.get(trig, 'C5')
+    color = _trigger_color(trig)
     ax.axvspan(event_row['t_start_utc'], event_row['t_end_utc'],
                color=color, alpha=0.35, zorder=2)
     ax.axvline(t_peak, color=color, lw=1.5, ls='--', zorder=3)
@@ -218,6 +226,9 @@ def plot_event_window(event_row: pd.Series,
         n = event_row.get('n_obs_in_window')
         n_txt = f", n_obs={int(n)}" if n is not None and not pd.isna(n) else ""
         lines.append(f"straddle amp: ±{pvs:.2f} m{n_txt}")
+    dev = event_row.get('peak_tide_dev_m')
+    if dev is not None and not pd.isna(dev):
+        lines.append(f"tide deviation: {dev:+.2f} m")
     if 'confidence' in event_row.index:
         lines.append(f"confidence: {event_row['confidence']:.2f}")
 
@@ -226,6 +237,242 @@ def plot_event_window(event_row: pd.Series,
             bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
                       edgecolor='0.7', alpha=0.9))
     return fig, ax
+
+
+# ---------------------------------------------------------------------------
+# GNSS-IR method illustration: one SNR arc + its Lomb-Scargle periodogram
+# ---------------------------------------------------------------------------
+
+def _best_arc_spectrum(year: int, doy: int) -> dict | None:
+    """Scan a day's arcs/signals and return the cleanest retrieval (highest
+    peak-to-noise, not edge-pinned) for the illustration. Dict keys:
+    spec (snr.arc_spectrum output), sig, arc (per-sample df), sat, arc_id."""
+    import snr
+    snr_df = snr.load_snr(year, doy)
+    arcs = snr.segment_arcs(snr_df)
+    if arcs.empty:
+        return None
+    best = None
+    for arc_id, g in arcs.groupby('arc_id', sort=True):
+        sat = int(g.sat.iloc[0])
+        for sig in c.signals_for_sat(sat):
+            spec = snr.arc_spectrum(g.elev.values, g[sig.snr_col].values, sig)
+            if spec is None or not np.isfinite(spec['rh']) or spec['edge_hit']:
+                continue
+            if best is None or spec['p2n'] > best['spec']['p2n']:
+                best = {'spec': spec, 'sig': sig, 'arc': g,
+                        'sat': sat, 'arc_id': int(arc_id)}
+    return best
+
+
+def _select_arc(year: int, doy: int,
+                arc_id: int | None = None,
+                signal_name: str | None = None) -> dict:
+    """Pick the arc/signal to illustrate: a specific (arc_id, signal_name)
+    if both given, otherwise the day's cleanest arc. Raises if none found."""
+    import snr
+    if arc_id is not None and signal_name is not None:
+        arcs = snr.segment_arcs(snr.load_snr(year, doy))
+        g = arcs[arcs.arc_id == arc_id]
+        if g.empty:
+            raise ValueError(f'arc_id {arc_id} not found on {year}-{doy:03d}')
+        sat = int(g.sat.iloc[0])
+        sig = next(s for s in c.signals_for_sat(sat) if s.name == signal_name)
+        spec = snr.arc_spectrum(g.elev.values, g[sig.snr_col].values, sig)
+        sel = {'spec': spec, 'sig': sig, 'arc': g, 'sat': sat, 'arc_id': arc_id}
+    else:
+        sel = _best_arc_spectrum(year, doy)
+    if sel is None or sel['spec'] is None:
+        raise ValueError(f'No clean arc found on {year}-{doy:03d}')
+    return sel
+
+
+def _ls_reconstruction(spec: dict, sig) -> tuple[np.ndarray, np.ndarray]:
+    """Least-squares amplitude/phase of the SNR oscillation at the retrieved
+    RH, evaluated on a fine sin(elev) grid. Returns (se_fine, fit)."""
+    se, dsnr = spec['sin_elev'], spec['dsnr']
+    omega = 4 * np.pi * spec['rh'] / sig.wavelength_m
+    M = np.column_stack([np.sin(omega * se), np.cos(omega * se)])
+    ab, *_ = np.linalg.lstsq(M, dsnr, rcond=None)
+    se_fine = np.linspace(se.min(), se.max(), 600)
+    fit = ab[0] * np.sin(omega * se_fine) + ab[1] * np.cos(omega * se_fine)
+    return se_fine, fit
+
+
+def plot_snr_oscillation(year: int, doy: int, *,
+                         arc_id: int | None = None,
+                         signal_name: str | None = None):
+    """Two-panel GNSS-IR illustration for a single arc/signal:
+      (left)  detrended SNR vs sin(elevation) — the interference oscillation,
+              with the Lomb-Scargle best-fit sinusoid overlaid;
+      (right) the LS periodogram (power vs reflector height) with the
+              retrieved RH peak marked.
+
+    If `arc_id`/`signal_name` are omitted, auto-picks the cleanest arc of the
+    day (highest peak-to-noise). Returns (fig, (ax_left, ax_right))."""
+    import matplotlib.pyplot as plt
+
+    sel = _select_arc(year, doy, arc_id, signal_name)
+    spec, sig, g, sat = sel['spec'], sel['sig'], sel['arc'], sel['sat']
+    se, dsnr = spec['sin_elev'], spec['dsnr']
+    order = np.argsort(se)
+    se_fine, fit = _ls_reconstruction(spec, sig)
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5.2))
+
+    # --- Left: SNR oscillation ---
+    axL.plot(se[order], dsnr[order], '.', ms=4, color='C0', alpha=0.65,
+             label='detrended SNR')
+    axL.plot(se_fine, fit, '-', color='C3', lw=1.9,
+             label=f'LS fit @ RH = {spec["rh"]:.2f} m')
+    axL.set_xlabel('sin(elevation angle)')
+    axL.set_ylabel('detrended SNR (volts)')
+    axL.set_title('SNR interference oscillation')
+    axL.legend(loc='upper right', fontsize=9)
+    axL.grid(True, alpha=0.3)
+
+    # --- Right: Lomb-Scargle periodogram ---
+    axR.plot(spec['heights'], spec['pgram'], color='C0', lw=1.4)
+    axR.axvline(spec['rh'], color='C3', ls='--', lw=1.5)
+    axR.plot(spec['rh'], spec['pgram'][spec['i_peak']], 'v',
+             color='C3', ms=9)
+    axR.set_xlabel('reflector height (m)')
+    axR.set_ylabel('normalized LS power')
+    axR.set_title('Lomb-Scargle periodogram')
+    axR.grid(True, alpha=0.3)
+    axR.text(0.97, 0.95,
+             f'RH = {spec["rh"]:.2f} m\n'
+             f'peak/noise = {spec["p2n"]:.1f}\n'
+             f'σ = {spec["sigma_rh"]*100:.1f} cm'
+             if np.isfinite(spec["sigma_rh"]) else
+             f'RH = {spec["rh"]:.2f} m\npeak/noise = {spec["p2n"]:.1f}',
+             transform=axR.transAxes, ha='right', va='top', fontsize=10,
+             bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                       edgecolor='0.7', alpha=0.9))
+
+    constel = c.constellation_for_sat(sat)
+    t_mid = g.time_utc.min() + (g.time_utc.max() - g.time_utc.min()) / 2
+    fig.suptitle(
+        f'{c.STATION.upper()} GNSS-IR — {constel} PRN {sat}, {sig.name}, '
+        f'{sel["arc"]["dir"].iloc[0]} arc\n'
+        f'{t_mid.strftime("%Y-%m-%d %H:%M UTC")}  ·  '
+        f'elev {spec["elev"].min():.1f}–{spec["elev"].max():.1f}°  ·  '
+        f'az {g.azim.mean():.0f}°  ·  {len(se)} samples',
+        y=1.02, fontsize=12)
+    fig.tight_layout()
+    return fig, (axL, axR)
+
+
+def plot_snr_walkthrough(year: int, doy: int, *,
+                         out_dir: Path | None = None,
+                         arc_id: int | None = None,
+                         signal_name: str | None = None,
+                         dpi: int | None = None) -> list[Path]:
+    """Break the two-panel GNSS-IR illustration into cumulative frames for a
+    presentation walkthrough, saved as numbered PNGs in `out_dir` (default
+    `plots/snr_walkthrough/`):
+
+      1_axes.png            empty axes — explain what each panel shows
+      2_snr_observations.png  + detrended SNR dots (left)
+      3_periodogram.png       + Lomb-Scargle periodogram (right)
+      4_peak_and_fit.png      + RH peak (right) and reconstructed wave (left)
+
+    Every frame shares identical axis limits so they overlay cleanly when
+    advancing slides. Returns the list of paths written, in order."""
+    import matplotlib.pyplot as plt
+
+    sel = _select_arc(year, doy, arc_id, signal_name)
+    spec, sig, g, sat = sel['spec'], sel['sig'], sel['arc'], sel['sat']
+    se, dsnr = spec['sin_elev'], spec['dsnr']
+    order = np.argsort(se)
+    se_fine, fit = _ls_reconstruction(spec, sig)
+
+    out_dir = Path(out_dir) if out_dir else (c.PLOTS_DIR / 'snr_walkthrough')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dpi = dpi or c.DPI
+
+    # Fixed limits so the panels don't shift between frames
+    se_pad = 0.02 * (se.max() - se.min())
+    d_amp  = float(np.max(np.abs(dsnr))) * 1.1
+    xL = (se.min() - se_pad, se.max() + se_pad)
+    yL = (-d_amp, d_amp)
+    xR = (float(spec['heights'].min()), float(spec['heights'].max()))
+    yR = (0.0, float(spec['pgram'].max()) * 1.12)
+
+    constel = c.constellation_for_sat(sat)
+    t_mid = g.time_utc.min() + (g.time_utc.max() - g.time_utc.min()) / 2
+    suptitle = (f'{c.STATION.upper()} GNSS-IR — {constel} PRN {sat}, {sig.name}, '
+                f'{g["dir"].iloc[0]} arc\n'
+                f'{t_mid.strftime("%Y-%m-%d %H:%M UTC")}  ·  '
+                f'elev {spec["elev"].min():.1f}–{spec["elev"].max():.1f}°  ·  '
+                f'{len(se)} samples')
+
+    def blank():
+        fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5.2))
+        axL.set_xlabel('sin(elevation angle)')
+        axL.set_ylabel('detrended SNR (volts)')
+        axL.set_title('SNR interference oscillation')
+        axL.set_xlim(*xL); axL.set_ylim(*yL); axL.grid(True, alpha=0.3)
+        axR.set_xlabel('reflector height (m)')
+        axR.set_ylabel('normalized LS power')
+        axR.set_title('Lomb-Scargle periodogram')
+        axR.set_xlim(*xR); axR.set_ylim(*yR); axR.grid(True, alpha=0.3)
+        fig.suptitle(suptitle, y=1.02, fontsize=12)
+        fig.tight_layout()
+        return fig, axL, axR
+
+    def add_dots(axL):
+        axL.plot(se[order], dsnr[order], '.', ms=4, color='C0', alpha=0.65,
+                 label='detrended SNR')
+        axL.legend(loc='upper right', fontsize=9)
+
+    def add_pgram(axR):
+        axR.plot(spec['heights'], spec['pgram'], color='C0', lw=1.4)
+
+    written: list[Path] = []
+
+    def save(fig, name):
+        p = out_dir / name
+        fig.savefig(p, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+        written.append(p)
+        print(f'  wrote {p.relative_to(c.PROJECT_DIR)}')
+
+    # Frame 1 — empty axes
+    fig, axL, axR = blank()
+    save(fig, '1_axes.png')
+
+    # Frame 2 — SNR observations (left)
+    fig, axL, axR = blank()
+    add_dots(axL)
+    save(fig, '2_snr_observations.png')
+
+    # Frame 3 — periodogram (right)
+    fig, axL, axR = blank()
+    add_dots(axL)
+    add_pgram(axR)
+    save(fig, '3_periodogram.png')
+
+    # Frame 4 — peak (right) + reconstructed component (left)
+    fig, axL, axR = blank()
+    add_dots(axL)
+    axL.plot(se_fine, fit, '-', color='C3', lw=1.9,
+             label=f'LS fit @ RH = {spec["rh"]:.2f} m')
+    axL.legend(loc='upper right', fontsize=9)
+    add_pgram(axR)
+    axR.axvline(spec['rh'], color='C3', ls='--', lw=1.5)
+    axR.plot(spec['rh'], spec['pgram'][spec['i_peak']], 'v', color='C3', ms=9)
+    axR.text(0.97, 0.95,
+             (f'RH = {spec["rh"]:.2f} m\npeak/noise = {spec["p2n"]:.1f}\n'
+              f'σ = {spec["sigma_rh"]*100:.1f} cm'
+              if np.isfinite(spec["sigma_rh"]) else
+              f'RH = {spec["rh"]:.2f} m\npeak/noise = {spec["p2n"]:.1f}'),
+             transform=axR.transAxes, ha='right', va='top', fontsize=10,
+             bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                       edgecolor='0.7', alpha=0.9))
+    save(fig, '4_peak_and_fit.png')
+
+    return written
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +578,26 @@ def generate(tag: str | None = None,
             fig.savefig(out, dpi=c.DPI, bbox_inches='tight')
             print(f'  wrote events/{fname}')
         written['events'] = ev_dir
+
+    # 4. GNSS-IR method illustration: one SNR arc + its periodogram.
+    # Use a day near the middle of the record (likely clean summer data).
+    mid_t = t_lo + (t_hi - t_lo) / 2
+    snr_year, snr_doy = int(mid_t.year), int(mid_t.dayofyear)
+    try:
+        fig, _ = plot_snr_oscillation(snr_year, snr_doy)
+        out = out_dir / f'snr_oscillation_{sub_tag}.png'
+        fig.savefig(out, dpi=c.DPI, bbox_inches='tight')
+        written['snr_oscillation'] = out
+        print(f'  wrote {out.relative_to(c.PROJECT_DIR)}')
+    except Exception as e:
+        print(f'  snr oscillation plot skipped: {type(e).__name__}: {e}')
+
+    # 5. Step-by-step walkthrough frames of the same illustration
+    try:
+        frames = plot_snr_walkthrough(snr_year, snr_doy)
+        written['snr_walkthrough'] = frames[0].parent if frames else None
+    except Exception as e:
+        print(f'  snr walkthrough skipped: {type(e).__name__}: {e}')
 
     return written
 

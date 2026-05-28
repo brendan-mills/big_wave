@@ -37,8 +37,8 @@ import detect
 # =============================================================================
 
 # (year, doy) inclusive bounds. Either can be None to mean "all available".
-START_DATE = (2025, 85)            # 2025-03-26
-END_DATE   = (2025, 89)           # 2026-05-25
+START_DATE = (2025, 91)            # 2025-03-26
+END_DATE   = (2026, 140)           # 2026-05-25
 # START_DATE = (2025, 250)            # 2025-03-26
 # END_DATE   = (2025, 255)           
 
@@ -48,12 +48,17 @@ BIN_SEC    = 100.0                 # multi-sat bin width (s)
 FORCE      = False                 # True = reprocess everything (ignore caches)
 MAKE_PLOTS = True                  # False to skip stage 6
 
+# Refit invsnr only (chunked, seam-free) while REUSING cached snr66 + windowed
+# obs. Set True for one run to replace older single-day per-day caches with the
+# overlapping-chunk fit; then set back to False. Ignored unless USE_INVSNR.
+FORCE_INVSNR = True
+
 # When iterating on detector knobs, nuke just the detection-layer outputs
 # (events / innov / bursts parquets) and any cached plots, then run.
 # Preserves state.parquet (KF / invsnr — expensive to rebuild), binned obs,
 # windowed obs, and per-day caches. Re-run is sub-second for the detector
 # stage and seconds for plots.
-CLEAR_CACHED_RESULTS = True
+CLEAR_CACHED_RESULTS = False
 
 # Use gnssrefl's invsnr B-spline inversion in place of the custom
 # binning + KF stages (3+4). Stage 2 (windowed obs) still runs because
@@ -237,9 +242,10 @@ def stage_kalman(tag, binned_obs, tide_model, force):
 
 
 def stage_detect(tag, obs_df, state_df, tide_model, force):
-    """[5/6] Event detection: jumps in state water level OR bursts in obs
-    innovation variance. Both pathways merge into one event log with a
-    `trigger` column ∈ {'jump', 'variance', 'both'}. Returns events_df."""
+    """[5/6] Event detection: water-level jumps, bidirectional obs-scatter
+    bursts, OR sustained spline-vs-tide deviations (surges). The three
+    pathways merge into one event log with a `trigger` column ∈
+    {'jump', 'variance', 'surge'} or a '+'-joined combo. Returns events_df."""
     events_out = events_path(tag)
 
     if events_out.exists() and not force:
@@ -322,7 +328,7 @@ def run():
     from tide import GreenlandTideModel
     tm = GreenlandTideModel(c.LAT, c.LON)
     if USE_INVSNR:
-        state, _ = stage_invsnr(tag, date_filter, tm, FORCE)
+        state, _ = stage_invsnr(tag, date_filter, tm, FORCE or FORCE_INVSNR)
     else:
         binned = stage_bin(tag, windowed, BIN_SEC, FORCE)
         if binned.empty:
@@ -353,7 +359,7 @@ def run():
         print(f'  by trigger       : {breakdown}')
         print(f'\n  Top 5 events by confidence:')
         show = ['t_peak_utc', 'trigger', 'duration_sec', 'delta_m',
-                'peak_burst_amp_m', 'n_obs_in_window', 'confidence']
+                'peak_burst_amp_m', 'peak_tide_dev_m', 'confidence']
         print(events[show].head(5).round(3).to_string(index=False))
 
 

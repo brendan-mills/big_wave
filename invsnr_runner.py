@@ -155,18 +155,65 @@ def per_day_state_path(year: int, doy: int) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end drivers (single-day kernel + range orchestrator)
+# Chunked processing
+#
+# Each day's B-spline used to be fit independently, leaving the spline
+# endpoints at 00:00/24:00 weakly constrained → jagged midnight seams when
+# stitched (which leaked into false 'surge' events). gnssrefl's invsnr fits
+# ONE continuous spline across a doy→doy_end range (see spline_functions
+# .snr2spline: knots span the whole range, first/last knots are meant to be
+# ignored). So we fit overlapping multi-day CHUNKS and keep only the central
+# days — the unconstrained endpoints fall in the discarded buffer. Output
+# per-day caching is unchanged; only the fitting granularity differs.
 # ---------------------------------------------------------------------------
+
+CHUNK_DAYS   = 6     # central output days fit together as one continuous spline
+                     # (~25 s/day, ~2.5 min/chunk — the snrfit cost/day sweet
+                     #  spot; bigger chunks block longer with little speedup)
+OVERLAP_DAYS = 1     # buffer days fit on each side then discarded (kill seams)
 
 import time as _time     # avoid shadowing the `time` column name
 
 
-def run_one_day(
+def _snr_exists(year: int, doy: int, station: str) -> bool:
+    """True if a snr file exists for this station/year/doy."""
+    yy = year % 100
+    snr_dir = Path(os.environ['REFL_CODE']) / str(year) / 'snr' / station
+    return bool(list(snr_dir.glob(f'{station}{doy:03d}0.{yy:02d}.snr*')))
+
+
+def _day_bounds(year: int, doy: int) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """[start, end) tz-aware UTC bounds of one (year, doy)."""
+    start = pd.Timestamp(f'{year}-01-01', tz='UTC') + pd.Timedelta(days=doy - 1)
+    return start, start + pd.Timedelta(days=1)
+
+
+def _contiguous_runs(dates: list[tuple[int, int]]) -> list[list[tuple[int, int]]]:
+    """Split sorted (year, doy) dates into maximal runs of consecutive days
+    within a single year (a day d is consecutive to d+1, same year). Runs are
+    the units we fit continuous splines over; gaps and year boundaries break
+    them (and become the only places a seam can remain)."""
+    runs: list[list[tuple[int, int]]] = []
+    cur: list[tuple[int, int]] = []
+    for d in dates:
+        if cur and d[0] == cur[-1][0] and d[1] == cur[-1][1] + 1:
+            cur.append(d)
+        else:
+            if cur:
+                runs.append(cur)
+            cur = [d]
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def _fit_chunk(
     year: int,
-    doy: int,
+    fit_first: int,
+    fit_last: int,
+    keep_doys: list[int],
     *,
     tide_model,
-    force: bool = False,
     station: str = c.STATION,
     signal: str = 'L1+L2+L5',
     knot_space_hr: int = 3,
@@ -178,27 +225,11 @@ def run_one_day(
     outfile_type: str = 'txt',     # 'csv' triggers a format-string bug in
                                     # gnssrefl 4.1.5 (spline_functions L355) —
                                     # stay on 'txt' until fixed upstream.
-) -> pd.DataFrame:
-    """Run invsnr for one day, cache result, return state DataFrame.
-
-    Per-day caching means long ranges only re-process days that aren't
-    already on disk — same pattern as the per-day windowed obs cache.
-    """
-    cache = per_day_state_path(year, doy)
-    if cache.exists() and not force:
-        return pd.read_parquet(cache)
-
-    # gnssrefl's invsnr calls sys.exit() (→ SystemExit) if the snr file is
-    # missing, which would abort the whole batch. Pre-check and raise a normal
-    # exception instead so run_range can skip just this day and continue.
-    yy = year % 100
-    snr_dir = Path(os.environ['REFL_CODE']) / str(year) / 'snr' / station
-    if not list(snr_dir.glob(f'{station}{doy:03d}0.{yy:02d}.snr*')):
-        raise FileNotFoundError(
-            f'no snr file for {station} {year} doy {doy} in {snr_dir} '
-            '(rinex2snr produced none — likely missing/empty RINEX)'
-        )
-
+) -> dict[int, pd.DataFrame]:
+    """Fit one continuous invsnr spline over [fit_first, fit_last] (day-of-year,
+    same year), then split the output and cache only the `keep_doys`. The
+    buffer days outside `keep_doys` exist purely to constrain the spline
+    endpoints and are discarded. Returns {doy: state} for the kept days."""
     ensure_config(
         station=station,
         rh_min=c.RH_MIN, rh_max=c.RH_MAX,
@@ -208,13 +239,14 @@ def run_one_day(
     )
 
     # invsnr writes to a fixed default path. Remove any stale file so we
-    # don't accidentally parse last day's output.
+    # don't accidentally parse a previous chunk's output.
     out_path = _default_output_path(station, ext=outfile_type)
     if out_path.exists():
         out_path.unlink()
 
     invsnr(
-        station=station, year=year, doy=doy, doy_end=None,
+        station=station, year=year, doy=fit_first,
+        doy_end=(fit_last if fit_last != fit_first else None),
         signal=signal,
         knot_space=knot_space_hr,
         delta_out=delta_out_sec,
@@ -227,17 +259,62 @@ def run_one_day(
 
     if not out_path.exists():
         raise RuntimeError(
-            f'invsnr produced no output for {station} {year} doy {doy}. '
+            f'invsnr produced no output for {station} {year} '
+            f'doy {fit_first}-{fit_last}. '
             'Check stdout for "no arcs found" or similar errors.'
         )
 
     parsed = parse_output(out_path)
-    state = to_state(parsed, tide_model,
-                     antenna_msl=c.ANTENNA_MSL_M,
-                     sigma_estimate_m=sigma_estimate_m)
+    results: dict[int, pd.DataFrame] = {}
+    for doy in keep_doys:
+        lo, hi = _day_bounds(year, doy)
+        day_rows = parsed[(parsed['t_utc'] >= lo) & (parsed['t_utc'] < hi)]
+        state = to_state(day_rows, tide_model,
+                         antenna_msl=c.ANTENNA_MSL_M,
+                         sigma_estimate_m=sigma_estimate_m)
+        if state.empty:
+            continue
+        cache = per_day_state_path(year, doy)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        state.to_parquet(cache, compression='snappy', index=False)
+        results[doy] = state
+    return results
 
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    state.to_parquet(cache, compression='snappy', index=False)
+
+def run_one_day(
+    year: int,
+    doy: int,
+    *,
+    tide_model,
+    force: bool = False,
+    station: str = c.STATION,
+    **kwargs,
+) -> pd.DataFrame:
+    """Return one day's state, from cache or a single-day fit.
+
+    NOTE: a bare single-day fit has the weakly-constrained midnight endpoints
+    this module's chunking is designed to avoid. Prefer `run_range` (which
+    fits overlapping chunks) for production; this is for direct single-day use
+    and as a fallback.
+    """
+    cache = per_day_state_path(year, doy)
+    if cache.exists() and not force:
+        return pd.read_parquet(cache)
+
+    # gnssrefl's invsnr calls sys.exit() (→ SystemExit) if the snr file is
+    # missing. Pre-check and raise a normal exception instead.
+    if not _snr_exists(year, doy, station):
+        raise FileNotFoundError(
+            f'no snr file for {station} {year} doy {doy} '
+            '(rinex2snr produced none — likely missing/empty RINEX)'
+        )
+
+    res = _fit_chunk(year, doy, doy, [doy], tide_model=tide_model,
+                     station=station, **kwargs)
+    state = res.get(doy)
+    if state is None or state.empty:
+        raise RuntimeError(
+            f'invsnr produced no rows for {station} {year} doy {doy}.')
     return state
 
 
@@ -249,40 +326,79 @@ def run_range(
     fail_fast: bool = False,
     **kwargs,
 ) -> pd.DataFrame:
-    """Process each (year, doy) in `date_filter` day-by-day; stitch results.
+    """Fit `date_filter` in overlapping multi-day chunks, then stitch the
+    per-day caches into one state DataFrame.
 
-    `date_filter` is an iterable of `(year, doy)` tuples (the same shape
-    `main.build_date_filter` produces). Multi-year ranges work transparently.
-
-    One-line status per day; per-day cache means resumes are cheap.
-    Returns a single stitched state DataFrame in time order.
+    `date_filter` is an iterable of `(year, doy)` tuples (the shape
+    `main.build_date_filter` produces). Days are grouped into contiguous
+    same-year runs; each run is fit in `CHUNK_DAYS`-day chunks with
+    `OVERLAP_DAYS` buffer on each side (discarded) so the kept splines are
+    continuous across midnight. Per-day caches make resumes cheap; set
+    `force=True` to refit (required to replace older single-day caches).
     """
     dates = sorted(set(date_filter))
     if not dates:
         return pd.DataFrame()
+    station = kwargs.get('station', c.STATION)
 
-    print(f'invsnr: processing {len(dates)} day(s) (force={force})')
-    frames = []
+    print(f'invsnr: processing {len(dates)} day(s) '
+          f'(force={force}, chunk={CHUNK_DAYS}d +{OVERLAP_DAYS}d overlap)')
     t_start = _time.perf_counter()
-    for i, (year, doy) in enumerate(dates, 1):
-        t0 = _time.perf_counter()
-        try:
-            ds = run_one_day(year, doy, tide_model=tide_model,
-                              force=force, **kwargs)
-        # invsnr can sys.exit() (SystemExit, not Exception) on bad days;
-        # catch both so one bad day skips instead of killing the batch.
-        # KeyboardInterrupt (BaseException) still propagates.
-        except (Exception, SystemExit) as e:
-            print(f'  [{i:>3d}/{len(dates)}] {year}-{doy:03d}: '
-                  f'FAILED  {type(e).__name__}: {e}')
-            if fail_fast:
-                raise
+
+    # --- Phase 1: fit needed days as overlapping chunks (seam-free splines) ---
+    days_with_snr = [(y, d) for (y, d) in dates if _snr_exists(y, d, station)]
+    n_missing = len(dates) - len(days_with_snr)
+    if n_missing:
+        print(f'  ({n_missing} day(s) have no snr file — skipped)')
+
+    for run_days in _contiguous_runs(days_with_snr):
+        year = run_days[0][0]
+        doys = [d for (_, d) in run_days]
+        n = len(doys)
+        i = 0
+        while i < n:
+            chunk = doys[i:i + CHUNK_DAYS]
+            need = [d for d in chunk
+                    if force or not per_day_state_path(year, d).exists()]
+            if need:
+                lo_i = max(0, i - OVERLAP_DAYS)
+                hi_i = min(n - 1, i + len(chunk) - 1 + OVERLAP_DAYS)
+                fit_first, fit_last = doys[lo_i], doys[hi_i]
+                t0 = _time.perf_counter()
+                try:
+                    _fit_chunk(year, fit_first, fit_last, chunk,
+                               tide_model=tide_model, **kwargs)
+                    el = _time.perf_counter() - t0
+                    print(f'  fit {year}-{fit_first:03d}..{fit_last:03d} '
+                          f'-> keep {chunk[0]:03d}..{chunk[-1]:03d}  '
+                          f'({len(chunk)}d, {el:.1f}s)')
+                except (Exception, SystemExit) as e:
+                    if fail_fast:
+                        raise
+                    # One bad day in the span fails the whole chunk; fall back
+                    # to single-day fits so the good days still land (those
+                    # days keep a midnight seam — acceptable for a few days).
+                    print(f'  fit {year}-{fit_first:03d}..{fit_last:03d}: '
+                          f'FAILED  {type(e).__name__}: {e}  '
+                          f'-> retrying day-by-day')
+                    for d in chunk:
+                        try:
+                            run_one_day(year, d, tide_model=tide_model,
+                                        force=True, **kwargs)
+                        except (Exception, SystemExit) as e2:
+                            print(f'    day {year}-{d:03d}: '
+                                  f'FAILED  {type(e2).__name__}: {e2}')
+            i += CHUNK_DAYS
+
+    # --- Phase 2: stitch from per-day caches ---
+    frames = []
+    for (year, doy) in dates:
+        cache = per_day_state_path(year, doy)
+        if not cache.exists():
             continue
-        elapsed = _time.perf_counter() - t0
-        cached = '   (cached)' if elapsed < 0.05 else ''
-        print(f'  [{i:>3d}/{len(dates)}] {year}-{doy:03d}: {len(ds):>4d} rows  '
-              f'{elapsed:5.1f}s{cached}')
-        frames.append(ds)
+        df = pd.read_parquet(cache)
+        if len(df):
+            frames.append(df)
 
     if not frames:
         return pd.DataFrame()

@@ -1,11 +1,11 @@
 """Event detection on the smoothed water-level state + raw observations.
 
-Two independent triggers, both expressed in absolute meters so the thresholds
+Three independent triggers, all expressed in absolute meters so the thresholds
 are physically interpretable:
 
   - jump:     `state.water_level_m` changes by ≥ `min_jump_m` within a
-              `state_jump_window_sec` rolling window. Catches sustained,
-              one-sided level shifts (surges).
+              `state_jump_window_sec` rolling window. Catches fast level
+              steps over minutes.
   - variance: obs scatter reaches ≥ `min_burst_amp_m` BOTH above and below
               the state line within `var_window_sec` — a "straddle"
               amplitude. Catches symmetric oscillation (wave trains). A
@@ -14,11 +14,16 @@ are physically interpretable:
               too. Guards against data-gap artifacts by requiring
               ≥ `min_var_samples` in the window, and drops single-obs
               outliers with `|mahal| > mahal_clip` before the rolling stat.
+  - surge:    the smoothed water level departs from the predicted tide —
+              |`state.eta_m`| (= water level − tide) stays ≥ `min_tide_dev_m`
+              over a `tide_dev_window_sec` rolling median. Catches sustained,
+              hours-long non-tidal offsets (storm surge, or — in winter —
+              sea-ice corruption of the retrieval).
 
-Any time interval that fires either trigger becomes a candidate event.
-Overlapping (or near-overlapping, within `max_event_gap_sec`) candidates
-from the two pathways merge into one event, with `trigger` recorded as
-'jump', 'variance', or 'both'.
+Any time interval that fires a trigger becomes a candidate event. Overlapping
+(or near-overlapping, within `max_event_gap_sec`) candidates merge into one
+event, with `trigger` recorded as a single label ('jump', 'variance',
+'surge') or a '+'-joined combination ('jump+surge', etc.).
 
 Output is a single `events.parquet`. The per-observation innovation log
 is saved as a sidecar `innov.parquet` for diagnostics.
@@ -41,9 +46,7 @@ import config as c
 
 @dataclass
 class DetectorConfig:
-    """Eight knobs. Two trigger pathways, three clustering knobs, one
-    geometry constant pulled from config.
-    """
+    """Three trigger pathways, two clustering knobs, one geometry constant."""
     # --- Trigger A: state-level jump ---
     state_jump_window_sec: float = 600.0   # 10 min look-back
     min_jump_m:            float = 1.0     # |Δwater_level| threshold
@@ -59,6 +62,12 @@ class DetectorConfig:
     mahal_clip:            float = 5.0     # drop obs with |innov/σ| > this
                                             # before the rolling stat — removes
                                             # single-obs spectral artifacts
+
+    # --- Trigger C: sustained deviation of the spline from the tide ---
+    tide_dev_window_sec:   float = 3600.0  # 1 hr rolling median of eta
+    min_tide_dev_m:        float = 0.75    # |water level − tide| threshold.
+                                            # eta noise floor ≈ 0.35 m (p95), so
+                                            # this is ~2× background.
 
     # --- Event clustering ---
     max_event_gap_sec:     float = 300.0   # merge fired intervals within this gap
@@ -166,6 +175,7 @@ def detect_jumps(state_df: pd.DataFrame,
             'water_level_at_peak_m': float(peak['water_level_m']),
             'peak_burst_amp_m':      np.nan,
             'n_obs_in_window':       np.nan,
+            'peak_tide_dev_m':       np.nan,
         })
     return pd.DataFrame(rows)
 
@@ -255,6 +265,62 @@ def detect_bursts(innov_df: pd.DataFrame,
             'water_level_at_peak_m': np.nan,
             'peak_burst_amp_m':      float(peak['straddle']),
             'n_obs_in_window':       int(peak['var_n']),
+            'peak_tide_dev_m':       np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Trigger C — sustained deviation of the spline from the predicted tide
+# ---------------------------------------------------------------------------
+
+def detect_surges(state_df: pd.DataFrame,
+                  config: DetectorConfig) -> pd.DataFrame:
+    """Flag intervals where the smoothed water level departs from the tide:
+    |rolling-median(eta)| ≥ `min_tide_dev_m` over `tide_dev_window_sec`,
+    where `eta = water_level − tide`.
+
+    The rolling median enforces a *sustained* offset (a brief spike won't
+    survive a 1-hr median), separating real surges from momentary noise.
+    """
+    if state_df is None or state_df.empty or 'eta_m' not in state_df.columns:
+        return pd.DataFrame()
+
+    state = state_df.sort_values('t_utc').reset_index(drop=True).copy()
+    indexed = state.set_index('t_utc')
+    window_str = f'{int(config.tide_dev_window_sec)}s'
+    eta_smooth = indexed['eta_m'].rolling(
+        window_str, center=True, min_periods=3).median()
+    state['eta_smooth'] = eta_smooth.to_numpy()
+
+    flagged_mask = state['eta_smooth'].abs() >= config.min_tide_dev_m
+    if not flagged_mask.any():
+        return pd.DataFrame()
+
+    flagged = state[flagged_mask].copy()
+    max_gap = pd.Timedelta(seconds=config.max_event_gap_sec)
+    flagged['event_id'] = (flagged['t_utc'].diff() > max_gap).cumsum()
+
+    rows = []
+    for _, grp in flagged.groupby('event_id', sort=True):
+        t_start  = grp['t_utc'].min()
+        t_end    = grp['t_utc'].max()
+        duration = (t_end - t_start).total_seconds()
+        if duration < config.min_event_duration_sec:
+            continue
+        # Peak = sample with the largest |smoothed eta| in the cluster
+        peak = grp.loc[grp['eta_smooth'].abs().idxmax()]
+        rows.append({
+            't_start_utc':           t_start,
+            't_end_utc':             t_end,
+            't_peak_utc':            peak['t_utc'],
+            'duration_sec':          float(duration),
+            'trigger':               'surge',
+            'delta_m':               np.nan,
+            'water_level_at_peak_m': float(peak['water_level_m']),
+            'peak_burst_amp_m':      np.nan,
+            'n_obs_in_window':       np.nan,
+            'peak_tide_dev_m':       float(peak['eta_smooth']),
         })
     return pd.DataFrame(rows)
 
@@ -263,22 +329,32 @@ def detect_bursts(innov_df: pd.DataFrame,
 # Merge overlapping jumps + bursts into one event list
 # ---------------------------------------------------------------------------
 
-def _pathway_strength(delta_m, burst_amp_m, config: DetectorConfig) -> float:
+_METRIC_COLS = ('delta_m', 'water_level_at_peak_m', 'peak_burst_amp_m',
+                'n_obs_in_window', 'peak_tide_dev_m')
+
+
+def _pathway_strength(delta_m, burst_amp_m, tide_dev_m,
+                      config: DetectorConfig) -> float:
     """Relative strength of an event: how many ×-thresholds it clears on the
-    stronger of its two pathways. NaN-safe (a pure jump has NaN burst amp and
-    vice versa)."""
-    jump = abs(delta_m) / config.min_jump_m if pd.notna(delta_m) else 0.0
-    var  = burst_amp_m / config.min_burst_amp_m if pd.notna(burst_amp_m) else 0.0
-    return max(jump, var)
+    strongest of its three pathways. NaN-safe (each pure trigger leaves the
+    other metrics NaN)."""
+    jump  = abs(delta_m) / config.min_jump_m if pd.notna(delta_m) else 0.0
+    var   = burst_amp_m / config.min_burst_amp_m if pd.notna(burst_amp_m) else 0.0
+    surge = abs(tide_dev_m) / config.min_tide_dev_m if pd.notna(tide_dev_m) else 0.0
+    return max(jump, var, surge)
 
 
-def _merge_overlapping(jumps: pd.DataFrame, bursts: pd.DataFrame,
+def _combine_triggers(a: str, b: str) -> str:
+    """Union two (possibly already '+'-joined) trigger labels, sorted."""
+    return '+'.join(sorted(set(a.split('+')) | set(b.split('+'))))
+
+
+def _merge_overlapping(frames: list[pd.DataFrame],
                        config: DetectorConfig) -> pd.DataFrame:
-    """Concatenate jumps and bursts; merge any whose time intervals overlap
-    (within `max_event_gap_sec`). Combined events get `trigger='both'`.
-    Pure jump events keep `trigger='jump'`, pure variance keep `'variance'`.
-    """
-    parts = [df for df in (jumps, bursts) if not df.empty]
+    """Concatenate all trigger frames; merge any whose time intervals overlap
+    (within `max_event_gap_sec`). A merged event's `trigger` is the '+'-joined
+    union of its constituents ('jump', 'variance', 'surge', 'jump+surge', …)."""
+    parts = [df for df in frames if df is not None and not df.empty]
     if not parts:
         return pd.DataFrame()
     all_ev = pd.concat(parts, ignore_index=True) \
@@ -296,28 +372,28 @@ def _merge_overlapping(jumps: pd.DataFrame, bursts: pd.DataFrame,
             cur['duration_sec'] = (pd.Timestamp(cur['t_end_utc'])
                                    - pd.Timestamp(cur['t_start_utc'])).total_seconds()
 
-            # Combine trigger labels
             if cur['trigger'] != nxt['trigger']:
-                cur['trigger'] = 'both'
+                cur['trigger'] = _combine_triggers(cur['trigger'], nxt['trigger'])
 
-            # Take stronger peak (the one with higher relative strength)
+            # Move the peak time to whichever pathway is strongest
             cur_strength = _pathway_strength(cur.get('delta_m'),
-                                             cur.get('peak_burst_amp_m'), config)
+                                             cur.get('peak_burst_amp_m'),
+                                             cur.get('peak_tide_dev_m'), config)
             nxt_strength = _pathway_strength(nxt.get('delta_m'),
-                                             nxt.get('peak_burst_amp_m'), config)
+                                             nxt.get('peak_burst_amp_m'),
+                                             nxt.get('peak_tide_dev_m'), config)
             if nxt_strength > cur_strength:
                 cur['t_peak_utc'] = nxt['t_peak_utc']
 
             # Carry over per-trigger metrics (NaN-aware combine)
-            for col in ('delta_m', 'water_level_at_peak_m',
-                        'peak_burst_amp_m', 'n_obs_in_window'):
+            for col in _METRIC_COLS:
                 nxt_val = nxt[col]
                 if pd.isna(nxt_val):
                     continue
                 cur_val = cur.get(col)
                 if pd.isna(cur_val):
                     cur[col] = nxt_val
-                elif col in ('delta_m', 'peak_burst_amp_m'):
+                elif col in ('delta_m', 'peak_burst_amp_m', 'peak_tide_dev_m'):
                     # take whichever has larger magnitude
                     if abs(nxt_val) > abs(cur_val):
                         cur[col] = nxt_val
@@ -327,12 +403,16 @@ def _merge_overlapping(jumps: pd.DataFrame, bursts: pd.DataFrame,
     merged.append(cur)
 
     out = pd.DataFrame(merged)
+    for col in _METRIC_COLS:               # ensure all metric cols exist
+        if col not in out.columns:
+            out[col] = np.nan
     out['event_id'] = range(len(out))
 
-    # Confidence: stronger of the two pathways × √(duration in min)
-    jump_str = (out['delta_m'].abs() / config.min_jump_m).fillna(0)
-    var_str  = (out['peak_burst_amp_m'] / config.min_burst_amp_m).fillna(0)
-    pathway  = pd.concat([jump_str, var_str], axis=1).max(axis=1)
+    # Confidence: strongest of the three pathways × √(duration in min)
+    jump_str  = (out['delta_m'].abs() / config.min_jump_m).fillna(0)
+    var_str   = (out['peak_burst_amp_m'] / config.min_burst_amp_m).fillna(0)
+    surge_str = (out['peak_tide_dev_m'].abs() / config.min_tide_dev_m).fillna(0)
+    pathway   = pd.concat([jump_str, var_str, surge_str], axis=1).max(axis=1)
     out['confidence'] = pathway * np.sqrt(out['duration_sec'] / 60.0)
 
     return out.sort_values('confidence', ascending=False).reset_index(drop=True)
@@ -359,7 +439,8 @@ def detect_events(obs_df: pd.DataFrame, state_df: pd.DataFrame,
 
     jumps  = detect_jumps(state_df, cfg)
     bursts = detect_bursts(innov, cfg)
-    events = _merge_overlapping(jumps, bursts, cfg)
+    surges = detect_surges(state_df, cfg)
+    events = _merge_overlapping([jumps, bursts, surges], cfg)
 
     if save_to is not None:
         save_to = Path(save_to)

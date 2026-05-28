@@ -220,29 +220,37 @@ def _peak_refine(pgram: np.ndarray, heights: np.ndarray, i: int
     return h_refined, sigma_gauss
 
 
-def estimate_rh_signal(elev_deg: np.ndarray, snr_db: np.ndarray,
-                       signal: c.Signal, *,
-                       min_pts: int | None = None) -> dict:
-    """Lomb-Scargle peak -> RH for one (arc-slice, signal).
-    Returns {'rh': m, 'sigma_rh': m, 'p2n': ratio, 'edge_hit': bool}.
-    NaN values when the SNR column is empty or the peak fit fails.
+def arc_spectrum(elev_deg: np.ndarray, snr_db: np.ndarray,
+                 signal: c.Signal, *,
+                 min_pts: int | None = None) -> dict | None:
+    """Shared Lomb-Scargle core for one (arc-slice, signal).
 
-    `min_pts` lets callers (e.g. windowed analysis) override the default
-    per-arc threshold with a smaller value appropriate for short windows.
+    Detrends the linear SNR against sin(elevation) and computes the
+    normalized LS periodogram over the RH search grid. Returns a dict with
+    every intermediate array plus the peak retrieval, or None if there aren't
+    enough valid points.
+
+    Both `estimate_rh_signal` (which extracts scalars) and the diagnostic
+    SNR/periodogram plot use this, so the illustration figure can never drift
+    from the math the pipeline actually runs.
+
+    Keys: elev, sin_elev, snr_lin, trend, dsnr (all per-sample),
+          heights, pgram (the search grid + periodogram),
+          i_peak, rh, sigma_rh, p2n, edge_hit.
     """
     if min_pts is None:
         min_pts = c.MIN_ARC_PTS
-    nan_out = {'rh': np.nan, 'sigma_rh': np.nan, 'p2n': np.nan, 'edge_hit': False}
 
     mask = snr_db > 0
     if mask.sum() < min_pts:
-        return nan_out
+        return None
 
     e = elev_deg[mask]
     snr_lin = 10 ** (snr_db[mask] / 20.0)            # dB-Hz -> volts
     se = np.sin(np.radians(e))
     coeffs = np.polyfit(se, snr_lin, c.DETREND_ORDER)
-    dsnr = snr_lin - np.polyval(coeffs, se)
+    trend = np.polyval(coeffs, se)
+    dsnr = snr_lin - trend
 
     heights = np.linspace(c.RH_MIN, c.RH_MAX, c.LS_NHEIGHTS)
     omegas = 4 * np.pi * heights / signal.wavelength_m
@@ -261,8 +269,28 @@ def estimate_rh_signal(elev_deg: np.ndarray, snr_db: np.ndarray,
                 if np.isfinite(sigma_gauss) and np.isfinite(p2n) and p2n > 0
                 else np.nan)
 
-    return {'rh': h_refined, 'sigma_rh': sigma_rh,
+    return {'elev': e, 'sin_elev': se, 'snr_lin': snr_lin, 'trend': trend,
+            'dsnr': dsnr, 'heights': heights, 'pgram': pgram, 'i_peak': i,
+            'rh': h_refined, 'sigma_rh': sigma_rh,
             'p2n': p2n, 'edge_hit': bool(edge_hit)}
+
+
+def estimate_rh_signal(elev_deg: np.ndarray, snr_db: np.ndarray,
+                       signal: c.Signal, *,
+                       min_pts: int | None = None) -> dict:
+    """Lomb-Scargle peak -> RH for one (arc-slice, signal).
+    Returns {'rh': m, 'sigma_rh': m, 'p2n': ratio, 'edge_hit': bool}.
+    NaN values when the SNR column is empty or the peak fit fails.
+
+    `min_pts` lets callers (e.g. windowed analysis) override the default
+    per-arc threshold with a smaller value appropriate for short windows.
+    """
+    spec = arc_spectrum(elev_deg, snr_db, signal, min_pts=min_pts)
+    if spec is None:
+        return {'rh': np.nan, 'sigma_rh': np.nan,
+                'p2n': np.nan, 'edge_hit': False}
+    return {'rh': spec['rh'], 'sigma_rh': spec['sigma_rh'],
+            'p2n': spec['p2n'], 'edge_hit': spec['edge_hit']}
 
 
 def estimate_arc(arc_df: pd.DataFrame) -> dict:
