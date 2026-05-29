@@ -1,55 +1,59 @@
 # big_wave — project context for Claude
 
-A multi-constellation, multi-frequency GNSS interferometric reflectometry
-(GNSS-IR) pipeline targeting real-time sea-level estimation and rogue-wave
-detection at Greenland coastal stations. Built on top of
+A multi-constellation GNSS interferometric reflectometry (GNSS-IR) pipeline for
+sea-level estimation and **wave-train detection** at Greenland coastal stations
+(currently UMNQ, Uummannaq). Built on top of
 [gnssrefl](https://github.com/kristinemlarson/gnssrefl).
 
-See [README.md](README.md) for setup. This file documents working conventions,
-design decisions, and current challenges — read first before suggesting
-changes.
+This file documents the working conventions, design decisions, and current
+challenges — read it first before suggesting changes.
 
 ---
 
 ## How to run
 
-**Always activate the env first.** All scripts depend on packages in the
-`gnssir` conda env:
+**Activate the env first.** Everything depends on the `gnssir` conda env:
 
 ```bash
 source /opt/anaconda3/etc/profile.d/conda.sh && conda activate gnssir
 ```
 
-**Single entry point** is `main.py`. The user runs everything from VS Code's
-Run button — **do not add argparse** anywhere. Edit constants at the top
-of `main.py` (`START_DATE`, `END_DATE`, `FORCE`, `MAKE_PLOTS`), then click
-Run.
+**Single entry point is `main.py`.** The user runs it from VS Code's Run button
+(or `python main.py`) — **never add argparse**. Edit the constants at the top of
+`main.py` (`START_DATE`, `END_DATE`, `FORCE`, `FORCE_INVSNR`, `MAKE_PLOTS`), then
+run. Each stage caches; `FORCE=True` reprocesses everything.
 
-Plots are produced by `plots.py`, also driven by constants at the top of
-its `__main__` block.
+To fetch new 1 Hz data: edit + run `download.py`. To re-tune the detector after a
+run: run `characterize_roughness.py`. To regenerate just the figures from cached
+results: run `plots_roughness.py`.
 
 ---
 
-## Architecture (5 layers + plots)
+## Architecture — a linear 1 Hz flow
 
 ```
-Layer 1  RAW              raw .d.Z RINEX files (data/rinex/)
-                                   │
-Layer 2  OBSERVATIONS     pipeline.py  ←  snr.py
-                          per-day per-arc + windowed obs parquets
-                                   │
-Layer 3  STATE            estimate.py  ←  tide.py (prior)
-                          1-D random-walk KF on η = water level − tide
-                                   │
-Layer 4  ANOMALY          detect.py
-                          spatial+temporal coherence test → event log
-                                   │
-Layer 5  OUTPUT           plots.py
+download.py ──► RINEX (1 Hz, .YYd.gz)         data/rinex_highrate/
+                        │
+  ┌─────────────────────┴───────────────────────────────────────┐
+  │ main.run()                                                    │
+  │                                                               │
+  │  1. invsnr   (invsnr_runner)  snr66 ─► water-level STATE      │  the reference
+  │               B-spline RH(t) vs tide  → state.parquet         │  (eta = WL − tide)
+  │                                                               │
+  │  2. roughness (pipeline ← snr) snr66 ─► per-day ROUGHNESS obs │  the wave signal
+  │               SNR-residual roughness, parallel across days    │
+  │                                                               │
+  │  3. detect   (detect)  state + roughness ─► events.parquet    │  TWO triggers:
+  │               surge (WL vs tide) + roughness burst            │  surge, roughness
+  │                                                               │
+  │  4. plots    (plots_roughness)  water-level overview + …      │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Each stage is idempotent (skips when its parquet exists). `main.py`
-orchestrates all of them with per-stage caching under
-`data/results/range/{tag}/`.
+Both `invsnr` and `roughness` read the **snr66** files (made by gnssrefl
+`rinex2snr`, created on demand). invsnr does its own RH retrieval internally — we
+do **not** run a custom Lomb-Scargle RH retrieval anymore. Range artifacts land
+under `data/.../range/{tag}/`; per-day caches under `data/.../{year}/`.
 
 ---
 
@@ -57,175 +61,128 @@ orchestrates all of them with per-stage caching under
 
 | File | Purpose |
 |---|---|
-| `config.py` | Single source of truth: paths, station coords, signal registry, all numeric knobs. **No env vars, no CLI.** |
-| `snr.py` | gnssrefl wrappers + per-arc + windowed Lomb-Scargle. Two outputs: per-arc (wide) and per-window (long form). |
-| `pipeline.py` | Per-day caching layer over `snr.py`. Both `process_folder` (per-arc) and `process_folder_windowed`. |
-| `tide.py` | Gr1kmTM tide model wrapper. Per-station harmonic constants and predictions. |
-| `estimate.py` | 1-D random-walk KF on (water level − tide). `bin_obs_by_time` for multi-sat consensus. |
-| `detect.py` | Coherent-event detection. 8 knobs, all in `DetectionConfig`. |
-| `plots.py` | All visualization. Loads from the cached parquets; doesn't re-run analysis. |
-| `main.py` | Top-level driver. Edit constants → click Run. |
+| `config.py` | Single source of truth: the `DATA_RATE` switch, paths, station coords, signal registry (`ENABLED_SIGNALS`), and all numeric knobs. **No env vars on import beyond what snr/invsnr_runner set; no CLI.** |
+| `snr.py` | gnssrefl `rinex2snr` wrapper (`ensure_snr`, `load_snr`), arc segmentation, and the per-(window, sat, signal) **SNR-residual roughness** (`process_arcs_roughness`). No RH retrieval. |
+| `invsnr_runner.py` | Wraps `gnssrefl.invsnr` (B-spline RH inversion) → water-level `state.parquet`. Overlapping seam-free chunks; per-chunk **subprocess timeout** to skip hangs; `INVSNR_DEC` decimation. |
+| `tide.py` | Gr1kmTM tide model wrapper (per-station harmonic constants + predictions). |
+| `pipeline.py` | Day discovery + **parallel day-map** (`N_WORKERS`) over the roughness stage + run provenance. |
+| `detect.py` | **Two triggers**: `surge` (sustained WL−tide) + `roughness` (coherent multi-sat burst). `detect_events` → `events.parquet`. |
+| `plots_roughness.py` | Water-level overview (tide + invsnr WL + event flags), roughness clustering timeline, top-5 per-event zooms. |
+| `main.py` | Orchestrator: invsnr → roughness → detect → plots. Edit constants → Run. |
+| `characterize_roughness.py` | Diagnostic: `rough_ratio` distribution + (ratio × sats) event-count grid to set `RoughnessConfig`. |
+| `download.py` | Fetch 1 Hz RINEX from EarthScope, Hatanaka+gzip compress per day. |
+| `constituents.py` | Validation: harmonic analysis of the invsnr water level vs Gr1kmTM constituents. |
 
 ---
 
 ## Working conventions (do these unprompted)
 
-- **Module-level constants, never argparse.** The user runs everything
-  from VS Code Run. CLI args break that workflow.
-- **Use the `gnssir` conda env** for all `Bash` invocations.
-- **Edit per-day parquet caches with care.** Stage 2 (windowed) takes
-  ~30–60 min for the full year. Don't `--force` casually.
-- **Keep `data/` out of git.** Everything under `data/` (raw RINEX, SNR
-  files, parquets, plots, sso_tokens.json) is gitignored. Don't bring
-  any of it into the source tree.
-- **Don't suggest microservices, async runtime, or web dashboards.** This
-  is a researcher's local pipeline. Keep it that way.
+- **Module-level constants, never argparse** — the user runs from VS Code Run.
+- **Use the `gnssir` conda env** for all Bash; use `python`, never system `python3`.
+- **Keep `data/` out of git** (raw RINEX, snr66, parquets, plots, SSO token). RINEX
+  file-format patterns are also in `.gitignore` as belt-and-suspenders.
+- **Never run two pipeline instances at once** — invsnr writes a *single shared
+  output file*, so concurrent runs corrupt each other's per-day caches.
+- **Full 1 Hz is required for roughness** (`RINEX_DEC=1`); decimation destroys the
+  fast SNR fluctuations the wave detector keys on.
+- **Don't reintroduce** the removed windowed-RH retrieval, the per-arc Lomb-Scargle,
+  or a Kalman filter — invsnr is the water-level reference now.
+- **Don't suggest microservices, async runtimes, or web dashboards** — local tool.
+- **`pip install pyarrow`**, never conda (libprotobuf incompatibility on arm64).
 
 ---
 
-## Current tuning (as of latest run)
+## Current tuning
 
 ### `config.py`
-| knob | value | what it does |
-|---|---|---|
-| `WINDOW_SEC` | 180 | Lomb-Scargle window length. Was 300; lowered to catch ~30 s wave events |
-| `STRIDE_SEC` | 30 | Window stride |
-| `RH_MIN, RH_MAX` | 6, 14 m | Water-level search range |
-| `ANTENNA_MSL_M` | 8.88 | User-calibrated. Used to convert RH ↔ water level |
-| `ENABLED_SIGNALS` | 8 | GPS L1/L2/L5, Galileo E1/E5a/E5b, **GLONASS G1/G2** (nominal FDMA freqs — see below) |
-
-### `estimate.TideKalmanConfig` (5 knobs)
 | knob | value | role |
 |---|---|---|
-| `sigma_p` | 5e-3 m/√s | random-walk process noise on η |
-| `gate_threshold` | 9.0 | mahal² cutoff for KF outlier rejection |
-| `sigma_inflation_m` | 0.15 | adds to obs σ — absorbs cross-sat scatter the per-window σ misses |
-| `init_eta_sigma` | 1.0 m | wide initial uncertainty so filter doesn't lock on early outlier |
-| `antenna_msl_m` | from config | converts RH → η |
+| `DATA_RATE` | `'1Hz'` | selects rate-specific paths + `RINEX_DEC`/`INVSNR_DEC`; `'15s'` re-roots to the archived set |
+| `RINEX_DEC` | 1 (1 Hz) | rinex2snr decimation; 1 = full rate (required for roughness) |
+| `INVSNR_DEC` | 15 (1 Hz) | invsnr's own SNR decimation — tide-scale spline gains nothing from 1 Hz and hangs on it |
+| `INVSNR_TIMEOUT_SEC` | 300 | per-chunk wall-clock cap; a hung chunk is skipped, not fatal |
+| `N_WORKERS` | cores−1 | parallel days in the roughness stage |
+| `ROUGH_WIN_SEC / STRIDE / MIN_PTS` | 20 / 5 / 15 | short-window residual-RMS roughness |
+| `RH_MIN, RH_MAX` | 4, 16 m | invsnr RH search range |
+| `AZ / EL window` | 30–180° / 5–25° | fjord-facing arcs |
+| `ENABLED_SIGNALS` | GPS L1/L2/L5, Gal E1/E5a/E5b, GLONASS G1/G2 | (GLONASS nominal FDMA freqs; ~3 cm bias, fine for roughness) |
 
-### `detect.DetectionConfig` (8 knobs)
+### `detect.DetectorConfig` (surge)
 | knob | value | role |
 |---|---|---|
-| `bin_sec` | 60 | time bin for clustering anomalous obs |
-| `mahal_threshold` | 2.5 | per-obs anomaly flag (in sigmas) |
-| `min_sats_per_bin` | 3 | spatial coherence: need ≥3 sats agreeing |
-| `coherence_ratio_min` | 2.5 | within dominant cluster: |median|/std ratio |
-| `min_amplitude_m` | 1.5 | hard floor — "only wave-class events" |
-| `snr_min` | 2.0 | event must be N× rolling 30-min innov std |
-| `max_event_gap_sec` | 120 | merge nearby candidate bins into one event |
+| `tide_dev_window_sec` | 3600 | 1 hr rolling median of eta |
+| `min_tide_dev_m` | 0.75 | sustained |WL−tide| threshold |
 
-The two amplitude knobs combined currently mean: detect events where many
-sats coherently see ≥1.5 m AND ≥2× the local noise. For typical local noise
-~80 cm, this means ≥2 m events make it through.
+### `detect.RoughnessConfig` (wave trains) — set from `characterize_roughness.py`
+| knob | value | role |
+|---|---|---|
+| `rough_ratio_min` | 4.0 | per-sat roughness vs its per-arc median (~p99.5 of the calm tail) |
+| `min_sats` | 4 | distinct sats coherently rough in a bin (spatial coherence) |
+| `bin_sec` | 30 | coherence time bin |
+
+These give ~25 episodic events over doy 110–240 / 2025 (clustered May 6–12 +
+late-Jul/early-Aug). Loosen to 3.0/4 for recall, tighten to 5.0/4 for precision.
 
 ---
 
 ## Key design decisions and rationale
 
-### Why random-walk KF instead of constant-velocity
-At sub-arc cadence (seconds–minutes), any inferred velocity is dominated by
-noise. The previous constant-velocity model would build spurious velocity
-estimates and run away — KF state diverging by meters in minutes, then
-gating all the *correct* obs as outliers. The 1-D position-only random walk
-has no velocity to corrupt.
+### Why roughness, not windowed RH, for fast waves
+A GNSS-IR RH retrieval needs a window long enough to sweep elevation and
+constrain the SNR oscillation frequency (period τ ≈ 30–90 s here). A window short
+enough to localize a ~10 s wave **can't constrain RH** — empirically a 60 s window
+pins RH at the grid ceiling (~15 m vs true ~9 m). So fast waves are detected from
+**SNR-residual roughness**: in a short window the slow RH oscillation is a smooth
+low-order trend, while a wave train injects fast fluctuations the trend can't
+absorb → residual RMS rises. No frequency fit needed, so a 20 s window is fine.
+Bonus: roughness has no P2N/RH gate, so all constellations contribute (GPS 43 % /
+Gal 39 % / GLONASS 17 %), unlike windowed RH which was 95 % GLONASS.
 
-### Why multi-sat consensus binning before the KF
-Per-window obs have ~50 cm σ. Binning by time (default 120 s — see
-`main.BIN_SEC`) and taking the inverse-variance weighted mean across all
-sats/bands in the bin tightens σ to ~30 cm. The KF sees a much cleaner
-signal; events still pop because they're spatially coherent (median
-survives outlier rejection).
+### Why invsnr is the water-level reference
+invsnr (gnssrefl) does a joint multi-sat/multi-freq B-spline RH(t) inversion —
+robust and validated, and it replaces the old custom LS retrieval + Kalman filter
+entirely. The surge trigger and the plots both read its `state.parquet`
+(`water_level_m`, `tide_m`, `eta_m`).
 
-### Why detect events on raw obs, not on KF state
-The KF state is smoothed — events get partially absorbed. The detector
-walks the **raw** windowed obs, computing each obs's innovation against
-the smoothed state, and looks for coherent multi-sat clusters of large
-innovations. The raw stream preserves event amplitude that the state
-smooths over.
+### Why two events only
+`surge` = sustained non-tidal water-level offset (storm surge / winter sea-ice
+corruption). `roughness` = a coherent multi-sat wave-train burst. The old jump and
+windowed-RH "straddle" triggers were removed.
 
-### Why the adaptive SNR gate
-Background noise varies massively: ~30 cm in calm summer, ~140 cm in
-fractured sea ice. A fixed amplitude threshold either floods the event
-log in winter (too low) or misses real events in summer (too high).
-"Event > N× local rolling-std" auto-scales.
+### Why the `DATA_RATE` switch re-roots everything
+The 1 Hz and 15 s datasets overlap in time, and every cache key is
+station/year/doy. `DATA_RATE` re-roots `RINEX_DIR`, the snr66 tree
+(`SNR_REFL_CODE`), and `RESULTS_DIR` into separate trees so the two never collide;
+orbits/exe/SSO-token are shared.
 
-### Why we re-added `min_amplitude_m` after consolidating gates
-The adaptive SNR gate alone has a failure mode: if local_noise is
-abnormally low (e.g., short calm window), even small events trigger.
-For "wave-class only" use, a hard amplitude floor in meters is the
-cleanest way to express user intent.
-
-### Why GLONASS is enabled despite FDMA caveat
-+40% more obs/day from ~19 satellites. The per-sat bias from using
-nominal channel-0 frequencies is ~3 cm at typical RH — well below
-per-window σ of ~50 cm. For sub-cm work you'd read channel numbers
-from a broadcast nav file; for wave detection it doesn't matter.
+### Why invsnr runs in a timeout subprocess
+gnssrefl's invsnr occasionally spins at 100 % CPU forever on a pathological chunk
+(seen ~doy 164). Each chunk runs in a spawned subprocess capped at
+`INVSNR_TIMEOUT_SEC`; on timeout it's killed and that chunk falls back to per-day
+fits (the bad day is skipped, the run continues).
 
 ---
 
 ## Known challenges and open questions
 
-### Sea ice conditions corrupt the signal
-At UMNQ in winter, the fjord fills with sea ice. The reflecting "surface"
-becomes a fractured, mobile patchwork of ice + water + snow. RH retrievals
-vary by 1–3 m across satellites at the same instant. The current detector
-correctly produces near-zero events during these periods (adaptive noise
-gate suppresses). But the underlying water level becomes unobservable —
-the system can't gauge water through ice.
+### No ground-truth validation (the big one)
+The ~25 events are an **operating point, not validated detections**. They cluster
+in time (plausible for real sea-state episodes), but none are confirmed.
+**Next step:** cross-check the clustered dates (esp. May 6–12) against Greenland
+weather/storm records or a nearby tide gauge.
 
-### No ground-truth validation
-We've never tested the detector against a known event. The 254 events
-flagged on the year-long dataset are unverified. Some look plausibly
-event-like (sustained multi-bin, 2 m+ amplitude, spatial coherence) but
-none have been confirmed against tide gauges, camera observations, or
-weather records.
+### Sea ice corrupts the signal
+In winter the fjord fills with mobile ice + water + snow; RH retrievals scatter by
+1–3 m across sats and the water level becomes unobservable. Surge can false-fire
+in these periods (sustained eta offset from ice, not surge).
 
-**Next obvious step:** find a known summer storm or surge event at a
-nearby Greenland tide gauge and check whether the detector flagged it.
-
-### Detection sensitivity is hard to tune blindly
-Without a known event to calibrate against, the threshold knobs are
-guesses. Current settings target 2 m+ events; if real waves are smaller
-or larger we won't know until we have ground truth.
-
-### Per-arc analysis is partially vestigial
-`pipeline.process_folder` still runs full-arc analysis on every day (stage
-1 of `main.py`). Its outputs aren't consumed by the rest of the pipeline
-anymore — only the `snr66` files it creates as a side effect of calling
-`rinex2snr` matter downstream. Could be simplified by replacing stage 1
-with a thin "ensure snr66 exists" loop.
-
-### plots.py auto-detects "most recent" range
-If you have multiple range/* dirs from different runs, plots.py picks
-the most recently modified one. Could surprise the user. If we add a
-results browser later this gets cleaner.
-
-### The 120 s bin width is a fixed compromise
-30 s bins are mostly singletons (no consensus benefit). 600 s bins
-average events away. 120 s gives ~3 obs/bin in current data. If we
-change `STRIDE_SEC` (now 30 s vs old 60 s), more obs per bin →
-binning gets more powerful, possibly time to revisit.
+### Detector thresholds are calibrated, not validated
+`RoughnessConfig` (4.0/4/30) was chosen from the roughness-ratio distribution, not
+against known waves. Re-run `characterize_roughness.py` if the data or window
+changes.
 
 ### Real-time runtime not built
-Everything is batch replay from disk. The clean separation between
-`snr.process_arcs_windowed` (per-arc, called as needed) and `estimate.run_batch`
-(stateful, processes obs in order) means streaming should be a thin wrapper
-around the same kernels. Not yet implemented.
-
----
-
-## What NOT to do
-
-| Don't | Why |
-|---|---|
-| Add CLI argparse to any entrypoint | User runs from VS Code Run button |
-| Force-rerun stages without permission | Stage 2 takes 30–60 min for full year |
-| Suggest re-architecting around microservices, async, or web UIs | Out of scope; researcher's local tool |
-| Re-enable removed dead code (CV Kalman, per-arc consensus) | Was deliberately deleted for clarity |
-| Add knobs without removing equivalent ones | The user explicitly wants fewer tunables |
-| Touch `data/` from git | Gitignored. Includes EarthScope SSO token |
-| Use the system `python3` | Project depends on `gnssir` conda env |
-| Install pyarrow via conda | Binary incompatibility with `libprotobuf` on macOS arm64. Use `pip install pyarrow` |
+Everything is batch replay from disk.
 
 ---
 
@@ -238,21 +195,35 @@ around the same kernels. Not yet implemented.
 | Antenna ellipsoidal height | 38.00 m |
 | Antenna height above MSL | 8.88 m (user-calibrated) |
 | Azimuth wedge (fjord-facing) | 30°–180° |
-| Constellations tracked | GPS, Galileo, GLONASS (no BeiDou, no QZSS — verified across full year) |
-| Typical conditions | Open water summer (May–Oct), variable to fractured ice (Nov–Apr) |
+| Constellations tracked | GPS, Galileo, GLONASS (no BeiDou, no QZSS — verified) |
+| Daily archive cadence | 15 s; **1 Hz** fetched separately by `download.py` for wave work |
+| Typical conditions | Open water summer (May–Oct), variable→fractured ice (Nov–Apr) |
 
 ---
 
-## Status checklist
+## What NOT to do
 
-- [x] `tide.py` — Gr1kmTM wrapper
-- [x] `config.py` — multi-constellation signal registry
-- [x] `snr.py` — per-arc + windowed Lomb-Scargle with σ
-- [x] `pipeline.py` — batch RINEX → per-day parquets
-- [x] `estimate.py` — random-walk Kalman filter, binning, multi-sat consensus
-- [x] `detect.py` — coherent-event detection with 8 knobs
-- [x] `plots.py` — water level overlay, residual, per-event window plots
-- [x] `main.py` — single-entry orchestrator
-- [ ] Validation against known events
+| Don't | Why |
+|---|---|
+| Add CLI argparse to any entrypoint | User runs from VS Code Run button |
+| Run two pipeline instances at once | invsnr's shared output file → cache corruption |
+| Decimate the 1 Hz RINEX (`RINEX_DEC`>1) | kills the fast SNR signal roughness needs |
+| Reintroduce windowed-RH / per-arc LS / Kalman | deliberately removed; invsnr is the reference |
+| Suggest microservices, async, or web UIs | out of scope; researcher's local tool |
+| Touch `data/` from git | gitignored; includes the EarthScope SSO token |
+| Use system `python3` / conda-install pyarrow | needs the `gnssir` env; pyarrow via pip only |
+
+---
+
+## Status
+
+- [x] `download.py` — 1 Hz fetch + Hatanaka/gzip compression
+- [x] `snr.py` — snr66 + SNR roughness
+- [x] `invsnr_runner.py` — water-level state, seam-free chunks, hang-proof timeout
+- [x] `pipeline.py` — parallel roughness stage
+- [x] `detect.py` — surge + roughness
+- [x] `plots_roughness.py` — water-level overview + roughness highlights
+- [x] `main.py` — invsnr → roughness → detect → plots
+- [ ] Ground-truth validation of events
 - [ ] Streaming / real-time runtime
 - [ ] Multi-station support

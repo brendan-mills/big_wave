@@ -16,6 +16,18 @@ data/
 *.parquet
 sso_tokens.json
 
+# RINEX observations — uncompressed + compressed (the bulky raw data).
+# RINEX 2: ssssDDD0.YYo (obs) / .YYd (Hatanaka); RINEX 3: .rnx / .crx.
+# (.YYo.Z / .YYd.Z are already covered by *.Z above.)
+*.[0-9][0-9]o
+*.[0-9][0-9]d
+*.[0-9][0-9]o.gz
+*.[0-9][0-9]d.gz
+*.rnx
+*.crx
+*.rnx.gz
+*.crx.gz
+
 # ---------------------------------------------------------------------------
 # Python
 # ---------------------------------------------------------------------------

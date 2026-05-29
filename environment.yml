@@ -32,3 +32,5 @@ dependencies:
   - pip:
     - gnssrefl>=4.1
     - pyarrow>=20      # parquet engine; PyPI only (see note above)
+    - hatanaka         # Hatanaka/gzip RINEX (de)compression for download.py
+                       # (bundles rnx2crx; gnssrefl ships only CRX2RNX)
