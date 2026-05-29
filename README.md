@@ -1,20 +1,26 @@
-# big_wave
+# Project Big Wave
 
-A multi-constellation GNSS interferometric reflectometry (GNSS-IR) pipeline for
+This is a group project completed at the WHOI NASA Summer School for Sea Sevel Science held in Woods Hole during May 2026.
+Project code written by Brendan Mills (well mostly Claude) for a project with Erin Robson and Kelly McKeon. 
+The Big Wave project was motivated by lectures given by Mike Willis (VTech) on using GNSS interferometric reflectometry (GNSS-IR) 
+to detect tsunami scale waves in the fjords of Greenland.
+These events can be cuased by calving or disintegration of icebergs in coastal waters and can pose significant risk to people and coastal infrastructure. 
+
+The following code base is a multi-constellation GNSS-IR pipeline for
 sea-level estimation and **wave-train detection** at Greenland coastal stations
 (currently **UMNQ**, Uummannaq).
 
 Built on top of [gnssrefl](https://github.com/kristinemlarson/gnssrefl).
 
 See [CLAUDE.md](CLAUDE.md) for design rationale and conventions — read that first
-if you're contributing.
+if you're contributing (or an AI).
 
 ## What it does
 
 For one GNSS station the pipeline turns raw 1 Hz RINEX into a water-level record
 and a candidate event log, in four stages:
 
-1. **invsnr** — gnssrefl's B-spline RH(t) inversion of the SNR data gives a
+1. **invsnr** — gnssrefl's B-spline reflector height time series (RH(t)) inversion of the SNR data gives a
    smoothed **water-level state** (and η = water level − predicted Gr1kmTM tide).
    This is the reference signal.
 2. **roughness** — for every satellite arc, a short sliding window measures the
