@@ -101,7 +101,7 @@ under `data/.../range/{tag}/`; per-day caches under `data/.../{year}/`.
 | `RINEX_DEC` | 1 (1 Hz) | rinex2snr decimation; 1 = full rate (required for roughness) |
 | `INVSNR_DEC` | 15 (1 Hz) | invsnr's own SNR decimation — tide-scale spline gains nothing from 1 Hz and hangs on it |
 | `INVSNR_TIMEOUT_SEC` | 300 | per-chunk wall-clock cap; a hung chunk is skipped, not fatal |
-| `N_WORKERS` | cores−1 | parallel days in the roughness stage |
+| `N_WORKERS` / `SNR_WORKERS` | RAM-bounded (6 / 3 on a 16 GB box) | parallel days — roughness / snr66 creation. Capped by RAM, not cores: at 1 Hz a day is several GB resident, so cores−1 froze a 16 GB Mac. Workers recycle per day (`maxtasksperchild=1`). |
 | `ROUGH_WIN_SEC / STRIDE / MIN_PTS` | 20 / 5 / 15 | short-window residual-RMS roughness |
 | `RH_MIN, RH_MAX` | 4, 16 m | invsnr RH search range |
 | `AZ / EL window` | 30–180° / 5–25° | fjord-facing arcs |

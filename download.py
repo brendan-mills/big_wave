@@ -56,7 +56,8 @@ STATION9   = 'UMNQ'          # 9-char long name, REQUIRED for RINEX 3 downloads
 # years (e.g. (2024, 350) -> (2025, 030) downloads doy 350-366 of 2024 + 1-30
 # of 2025). Files are named by 2-digit year so different years don't collide.
 START_DATE = (2023, 200)       # 2023-07-19, earliest 1 Hz at UMNQ
-END_DATE   = (2025, 109)       # day before main's (2025,110-240) range -> disjoint
+END_DATE   = (2026, 149)       # 2026-05-29 (present). Resumable: already-have days
+                                # skip, so this just fills forward from the last gap.
 
 RATE       = 'high'            # 'high' = 1 Hz archive folder ('low' = daily 15 s)
 SAMPLERATE = 1                 # native interval (s) of the high-rate file

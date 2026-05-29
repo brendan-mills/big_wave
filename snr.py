@@ -1,15 +1,15 @@
 """SNR file processing for SSiSLS.
 
-Wraps gnssrefl for RINEX -> SNR conversion and SNR file reading. Provides
-arc segmentation and multi-constellation Lomb-Scargle RH estimation.
-
-The wide DataFrame returned by `process_arcs` is the canonical per-day output
-consumed by the rest of the pipeline (plots, Kalman filter, etc.).
+Wraps gnssrefl for RINEX -> snr66 conversion + reading, then provides arc
+segmentation and the per-(window, sat, signal) SNR-residual ROUGHNESS used for
+wave-train detection (`process_arcs_roughness`). The water-level reference comes
+from invsnr (see invsnr_runner), which reads the snr66 directly — so the old
+custom Lomb-Scargle RH retrieval was removed.
 """
 
 from __future__ import annotations
 
-import math
+import gzip
 import os
 import shutil
 import subprocess
@@ -18,70 +18,21 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.signal import lombscargle
 
 import config as c
 
-# gnssrefl reads these at import time, so set them before the imports below
-os.environ.setdefault('REFL_CODE', str(c.REFL_CODE))
-os.environ.setdefault('ORBITS',    str(c.ORBITS_DIR))
-os.environ.setdefault('EXE',       str(c.EXE_DIR))
+# gnssrefl reads these at import time, so set them before the imports below.
+# REFL_CODE is rate-specific (snr66 tree) so 1 Hz output never clobbers the 15 s
+# tree for overlapping doys; ORBITS/EXE stay shared (gnssrefl reads them from
+# their own env vars). Set REFL_CODE explicitly (not setdefault) so an inherited
+# shell value can't pin us to the wrong tree.
+os.environ['REFL_CODE'] = str(c.SNR_REFL_CODE)
+os.environ.setdefault('ORBITS', str(c.ORBITS_DIR))
+os.environ.setdefault('EXE',    str(c.EXE_DIR))
 
 from gnssrefl.gps import snr_name                          # noqa: E402
 from gnssrefl.read_snr_files import read_snr               # noqa: E402
 from gnssrefl.rinex2snr_cl import rinex2snr                # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# Station coordinates from a RINEX header (one-shot helper)
-# ---------------------------------------------------------------------------
-
-def coords_from_rinex(rinex_path: Path | str) -> dict:
-    """Extract approximate lat/lon/height (WGS-84) from a RINEX 2 obs header.
-
-    Accepts `.d.Z`, `.d.gz`, `.d`, `.o.gz`, `.o`. Hatanaka files are expanded
-    via `CRX2RNX` under `config.EXE_DIR`.
-    """
-    src = Path(rinex_path)
-    crx2rnx = c.EXE_DIR / 'CRX2RNX'
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        local = tmp / src.name
-        shutil.copy(src, local)
-
-        if local.suffix == '.Z':
-            subprocess.run(['uncompress', '-f', str(local)], check=True)
-            local = local.with_suffix('')
-        elif local.suffix == '.gz':
-            subprocess.run(['gunzip', '-f', str(local)], check=True)
-            local = local.with_suffix('')
-
-        if local.suffix.endswith('d'):
-            subprocess.run([str(crx2rnx), str(local)], check=True)
-            local = local.with_suffix(local.suffix[:-1] + 'o')
-
-        with open(local) as f:
-            X = Y = Z = None
-            for line in f:
-                if 'APPROX POSITION XYZ' in line:
-                    X, Y, Z = (float(v) for v in line.split()[:3])
-                    break
-                if 'END OF HEADER' in line:
-                    raise ValueError(f'APPROX POSITION XYZ not in header of {src}')
-
-    a, fl = 6378137.0, 1 / 298.257223563
-    e2 = fl * (2 - fl); b = a * (1 - fl); ep2 = (a*a - b*b) / (b*b)
-    p = math.hypot(X, Y)
-    th = math.atan2(Z * a, p * b)
-    lon = math.atan2(Y, X)
-    lat = math.atan2(Z + ep2 * b * math.sin(th)**3,
-                     p - e2 * a * math.cos(th)**3)
-    N = a / math.sqrt(1 - e2 * math.sin(lat)**2)
-    h = p / math.cos(lat) - N
-
-    return {'lat': math.degrees(lat), 'lon': math.degrees(lon), 'h': h,
-            'X': X, 'Y': Y, 'Z': Z}
 
 
 # ---------------------------------------------------------------------------
@@ -98,13 +49,37 @@ def snr_path(year: int, doy: int) -> Path:
     """Resolve the snr66 path (gzipped or plain) for this station/year/doy."""
     month, day = _doy_to_month_day(year, doy)
     fname = snr_name(c.STATION, year, month, day, str(c.SNR_TYPE))
-    base = c.REFL_CODE / f'{year}' / 'snr' / c.STATION / fname
+    base = c.SNR_REFL_CODE / f'{year}' / 'snr' / c.STATION / fname
     if base.exists():
         return base
     gz = base.with_suffix(base.suffix + '.gz')
     if gz.exists():
         return gz
     return base  # may not exist yet; caller decides what to do
+
+
+def _stage_rinex(src: Path) -> Path:
+    """Place an uncompressed copy of `src` in the CWD for gnssrefl's nolook
+    search, which recognizes plain '.YYd' (Hatanaka) / '.YYo' but NOT
+    '.YYd.gz' / '.YYd.Z'. Strips a '.gz'/'.Z' layer (keeping Hatanaka so
+    gnssrefl's own CRX2RNX expands it); copies a plain file as-is. Returns the
+    staged path.
+    """
+    if src.suffix in ('.gz', '.Z'):
+        dst = Path.cwd() / src.name[:-len(src.suffix)]
+        if not dst.exists():
+            if src.suffix == '.gz':
+                with gzip.open(src, 'rb') as fi, open(dst, 'wb') as fo:
+                    shutil.copyfileobj(fi, fo)
+            else:  # '.Z' is LZW — Python's gzip can't read it; use the CLI
+                tmp = Path.cwd() / src.name
+                shutil.copy(src, tmp)
+                subprocess.run(['uncompress', '-f', str(tmp)], check=True)
+        return dst
+    dst = Path.cwd() / src.name
+    if not dst.exists():
+        shutil.copy(src, dst)
+    return dst
 
 
 def ensure_snr(year: int, doy: int, force: bool = False) -> Path:
@@ -122,15 +97,22 @@ def ensure_snr(year: int, doy: int, force: bool = False) -> Path:
             f'No local RINEX for {c.STATION} {year} doy {doy} in {c.RINEX_DIR}')
     src = candidates[0]
 
-    # gnssrefl reads the RINEX from the current working directory
-    dst = Path.cwd() / src.name
-    if not dst.exists():
-        shutil.copy(src, dst)
-
-    rinex2snr(
-        station=c.STATION, year=year, doy=doy,
-        nolook=c.NOLOOK, orb=c.ORB, overwrite=force,
-    )
+    # gnssrefl's nolook translator reads the RINEX from — and writes its
+    # intermediates (.YYo, re-gzipped .YYd) into — the CWD. Run inside a
+    # throwaway temp dir so (a) concurrent day-workers never collide on the
+    # staged file / gnssrefl temp files, and (b) the bulky 1 Hz intermediates
+    # are auto-removed. The snr66 goes to $REFL_CODE (absolute), so it survives.
+    cwd0 = Path.cwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        os.chdir(tmp)
+        try:
+            _stage_rinex(src)
+            rinex2snr(
+                station=c.STATION, year=year, doy=doy,
+                nolook=c.NOLOOK, orb=c.ORB, overwrite=force, dec=c.RINEX_DEC,
+            )
+        finally:
+            os.chdir(cwd0)
 
     p = snr_path(year, doy)
     if not p.exists():
@@ -198,193 +180,39 @@ def segment_arcs(snr_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Per-arc, per-signal RH estimation
-# ---------------------------------------------------------------------------
-
-def _peak_refine(pgram: np.ndarray, heights: np.ndarray, i: int
-                 ) -> tuple[float, float]:
-    """3-point parabolic peak refinement. Returns (h_refined, sigma_gauss).
-    `sigma_gauss` is the local Gaussian-equivalent peak width (m); NaN if the
-    triple isn't a proper maximum (edge of grid or concave-up).
-    """
-    if i <= 0 or i >= len(pgram) - 1:
-        return float(heights[i]), float('nan')
-    p_lo, p_mid, p_hi = float(pgram[i-1]), float(pgram[i]), float(pgram[i+1])
-    denom = p_lo + p_hi - 2 * p_mid          # < 0 for a proper maximum
-    if denom >= 0:
-        return float(heights[i]), float('nan')
-    dh = float(heights[1] - heights[0])
-    delta = 0.5 * (p_lo - p_hi) / denom      # fractional-bin offset in [-0.5, 0.5]
-    h_refined = float(heights[i]) + delta * dh
-    sigma_gauss = dh * float(np.sqrt(p_mid / abs(denom)))
-    return h_refined, sigma_gauss
-
-
-def arc_spectrum(elev_deg: np.ndarray, snr_db: np.ndarray,
-                 signal: c.Signal, *,
-                 min_pts: int | None = None) -> dict | None:
-    """Shared Lomb-Scargle core for one (arc-slice, signal).
-
-    Detrends the linear SNR against sin(elevation) and computes the
-    normalized LS periodogram over the RH search grid. Returns a dict with
-    every intermediate array plus the peak retrieval, or None if there aren't
-    enough valid points.
-
-    Both `estimate_rh_signal` (which extracts scalars) and the diagnostic
-    SNR/periodogram plot use this, so the illustration figure can never drift
-    from the math the pipeline actually runs.
-
-    Keys: elev, sin_elev, snr_lin, trend, dsnr (all per-sample),
-          heights, pgram (the search grid + periodogram),
-          i_peak, rh, sigma_rh, p2n, edge_hit.
-    """
-    if min_pts is None:
-        min_pts = c.MIN_ARC_PTS
-
-    mask = snr_db > 0
-    if mask.sum() < min_pts:
-        return None
-
-    e = elev_deg[mask]
-    snr_lin = 10 ** (snr_db[mask] / 20.0)            # dB-Hz -> volts
-    se = np.sin(np.radians(e))
-    coeffs = np.polyfit(se, snr_lin, c.DETREND_ORDER)
-    trend = np.polyval(coeffs, se)
-    dsnr = snr_lin - trend
-
-    heights = np.linspace(c.RH_MIN, c.RH_MAX, c.LS_NHEIGHTS)
-    omegas = 4 * np.pi * heights / signal.wavelength_m
-    pgram = lombscargle(se, dsnr, omegas, normalize=True)
-
-    i = int(np.argmax(pgram))
-    p_max = float(pgram[i])
-    p_med = float(np.median(pgram))
-    p2n = p_max / p_med if p_med > 0 else np.nan
-
-    edge_tol = max(1, c.LS_NHEIGHTS // 100)          # within 1% of grid edges
-    edge_hit = (i < edge_tol) or (i >= c.LS_NHEIGHTS - edge_tol)
-
-    h_refined, sigma_gauss = _peak_refine(pgram, heights, i)
-    sigma_rh = (sigma_gauss / np.sqrt(p2n)
-                if np.isfinite(sigma_gauss) and np.isfinite(p2n) and p2n > 0
-                else np.nan)
-
-    return {'elev': e, 'sin_elev': se, 'snr_lin': snr_lin, 'trend': trend,
-            'dsnr': dsnr, 'heights': heights, 'pgram': pgram, 'i_peak': i,
-            'rh': h_refined, 'sigma_rh': sigma_rh,
-            'p2n': p2n, 'edge_hit': bool(edge_hit)}
-
-
-def estimate_rh_signal(elev_deg: np.ndarray, snr_db: np.ndarray,
-                       signal: c.Signal, *,
-                       min_pts: int | None = None) -> dict:
-    """Lomb-Scargle peak -> RH for one (arc-slice, signal).
-    Returns {'rh': m, 'sigma_rh': m, 'p2n': ratio, 'edge_hit': bool}.
-    NaN values when the SNR column is empty or the peak fit fails.
-
-    `min_pts` lets callers (e.g. windowed analysis) override the default
-    per-arc threshold with a smaller value appropriate for short windows.
-    """
-    spec = arc_spectrum(elev_deg, snr_db, signal, min_pts=min_pts)
-    if spec is None:
-        return {'rh': np.nan, 'sigma_rh': np.nan,
-                'p2n': np.nan, 'edge_hit': False}
-    return {'rh': spec['rh'], 'sigma_rh': spec['sigma_rh'],
-            'p2n': spec['p2n'], 'edge_hit': spec['edge_hit']}
-
-
-def estimate_arc(arc_df: pd.DataFrame) -> dict:
-    """Run all applicable signals on one arc; returns a flat row dict."""
-    sat = int(arc_df.sat.iloc[0])
-    t0_utc = arc_df.time_utc.min()
-    t1_utc = arc_df.time_utc.max()
-    row = {
-        'arc_id':         int(arc_df.arc_id.iloc[0]),
-        'sat':            sat,
-        'constellation':  c.constellation_for_sat(sat),
-        'dir':            str(arc_df['dir'].iloc[0]),
-        'pass_id':        int(arc_df.pass_id.iloc[0]),
-        'n_pts':          len(arc_df),
-        'az_mean':        round(float(arc_df.azim.mean()), 2),
-        'year':           int(arc_df.year.iloc[0]),
-        'doy':            int(arc_df.doy.iloc[0]),
-        't_start_sec':    float(arc_df.sec.min()),
-        't_end_sec':      float(arc_df.sec.max()),
-        't_start_utc':    t0_utc,
-        't_end_utc':      t1_utc,
-        't_mid_utc':      t0_utc + (t1_utc - t0_utc) / 2,
-    }
-    for sig in c.signals_for_sat(sat):
-        res = estimate_rh_signal(
-            arc_df.elev.values, arc_df[sig.snr_col].values, sig)
-        row[f'RH_{sig.name}']    = (round(res['rh'], 4)
-                                     if np.isfinite(res['rh']) else np.nan)
-        row[f'sigma_{sig.name}'] = (round(res['sigma_rh'], 4)
-                                     if np.isfinite(res['sigma_rh']) else np.nan)
-        row[f'p2n_{sig.name}']   = (round(res['p2n'], 2)
-                                     if np.isfinite(res['p2n']) else np.nan)
-        row[f'edge_{sig.name}']  = bool(res['edge_hit'])
-    return row
-
-
-def process_arcs(snr_df: pd.DataFrame) -> pd.DataFrame:
-    """End-to-end per-day: segment + multi-signal estimation + P2N gate.
-    Returns wide DataFrame, one row per arc.
-    """
-    arcs = segment_arcs(snr_df)
-    if len(arcs) == 0:
-        return pd.DataFrame()
-
-    rows = [estimate_arc(g) for _, g in arcs.groupby('arc_id', sort=True)]
-    df = pd.DataFrame(rows).sort_values(['t_start_sec', 'sat']).reset_index(drop=True)
-
-    # Quality gates: null out RH (and its sigma) where p2n is too low or the
-    # retrieval is pinned at the search-window edge
-    for sig in c.ENABLED_SIGNALS:
-        rh_col   = f'RH_{sig.name}'
-        sig_col  = f'sigma_{sig.name}'
-        p2n_col  = f'p2n_{sig.name}'
-        edge_col = f'edge_{sig.name}'
-        if p2n_col not in df.columns:
-            continue
-        bad = (df[p2n_col] < c.P2N_MIN) | df[edge_col].fillna(False)
-        df.loc[bad, rh_col]  = np.nan
-        df.loc[bad, sig_col] = np.nan
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Sub-arc / windowed observations
+# SNR roughness (sea-state / wave-train detection)
 #
-# For rogue-wave timescales the full-arc averaging above is too slow
-# (~30 min cadence). The functions below slide a fixed-length window through
-# each arc and run `estimate_rh_signal` per window per signal, producing a
-# long-form observation stream at the seconds-to-minutes timescale required
-# for transient detection.
+# A wave train roughens the reflecting surface, injecting FAST SNR fluctuations
+# (~the wave period) that the slow geometry can't produce. In a short window the
+# RH oscillation (period >= ~30 s) is a smooth low-order trend; the residual RMS
+# after removing that trend is the fast-fluctuation "roughness". This needs NO
+# frequency fit, so the short window that defeats RH retrieval is fine here.
 # ---------------------------------------------------------------------------
 
-def rolling_rh_per_arc(arc_long_df: pd.DataFrame,
-                        window_sec: float = c.WINDOW_SEC,
-                        stride_sec: float = c.STRIDE_SEC) -> pd.DataFrame:
-    """Slide a window through one arc's per-sample SNR data; run
-    `estimate_rh_signal` on each window for every applicable signal.
+def _window_roughness(t_rel: np.ndarray, snr_lin: np.ndarray) -> float:
+    """RMS of the SNR residual after a low-order polynomial detrend in time,
+    normalized by the window-mean SNR (dimensionless, so it's comparable across
+    elevations/sats). NaN if too few points."""
+    if len(snr_lin) < c.ROUGH_MIN_PTS:
+        return float('nan')
+    mean = float(np.mean(snr_lin))
+    if mean <= 0:
+        return float('nan')
+    coeffs = np.polyfit(t_rel, snr_lin, c.ROUGH_DETREND_ORDER)
+    resid = snr_lin - np.polyval(coeffs, t_rel)
+    return float(np.sqrt(np.mean(resid ** 2)) / mean)
 
-    Parameters
-    ----------
-    arc_long_df : per-sample DataFrame for ONE arc (single arc_id), e.g.
-                  `segment_arcs(snr_df).query('arc_id == X')`.
-    window_sec  : window length in seconds.
-    stride_sec  : window stride in seconds.
 
-    Returns long-form DataFrame, one row per (window, signal) with a finite
-    retrieval:
-        t_center_utc, arc_id, sat, constellation, dir, pass_id,
-        signal, snr_col, n_pts_window, elev_center, azim_center,
-        rh, sigma, p2n, edge_hit
+def rolling_roughness_per_arc(arc_long_df: pd.DataFrame,
+                              window_sec: float = c.ROUGH_WIN_SEC,
+                              stride_sec: float = c.ROUGH_STRIDE_SEC) -> pd.DataFrame:
+    """Slide a short window through one arc; per signal, emit the SNR-residual
+    roughness. Long-form, one row per (window, signal):
+        t_center_utc, arc_id, sat, constellation, dir, pass_id, signal,
+        snr_col, n_pts_window, elev_center, azim_center, roughness
     """
     if arc_long_df.empty:
         return pd.DataFrame()
-
     sat = int(arc_long_df.sat.iloc[0])
     direction = str(arc_long_df['dir'].iloc[0])
     pass_id = int(arc_long_df.pass_id.iloc[0])
@@ -398,46 +226,37 @@ def rolling_rh_per_arc(arc_long_df: pd.DataFrame,
     t_max = arc_long_df.time_utc.max()
     half = pd.Timedelta(seconds=window_sec / 2)
     stride = pd.Timedelta(seconds=stride_sec)
-
-    # arc too short for even one full window
     if t_max - t_min < pd.Timedelta(seconds=window_sec):
         return pd.DataFrame()
-
     t_centers = pd.date_range(t_min + half, t_max - half, freq=stride)
 
-    out = []
-    # Sort once and pre-extract numpy arrays; use searchsorted for fast
-    # window slicing. (Comparing tz-aware datetime64 via searchsorted needs
-    # both sides in the same naive ns representation.)
     sorted_df = arc_long_df.sort_values('time_utc')
     times_ns = sorted_df.time_utc.dt.tz_convert('UTC').dt.tz_localize(None)\
                        .astype('datetime64[ns]').astype('int64').to_numpy()
     elev_arr = sorted_df.elev.to_numpy()
     azim_arr = sorted_df.azim.to_numpy()
-    snr_cols = {sig.snr_col: sorted_df[sig.snr_col].to_numpy()
-                for sig in applicable}
+    snr_cols = {sig.snr_col: sorted_df[sig.snr_col].to_numpy() for sig in applicable}
     half_ns = int(half.total_seconds() * 1e9)
 
+    out = []
     for t_c in t_centers:
         t_c_ns = pd.Timestamp(t_c).tz_convert('UTC').tz_localize(None)\
                                    .to_datetime64().astype('datetime64[ns]')\
                                    .astype('int64')
-        lo_idx = int(np.searchsorted(times_ns, t_c_ns - half_ns, side='left'))
-        hi_idx = int(np.searchsorted(times_ns, t_c_ns + half_ns, side='right'))
-        n_pts = hi_idx - lo_idx
-        if n_pts < c.MIN_WIN_PTS:
+        lo = int(np.searchsorted(times_ns, t_c_ns - half_ns, side='left'))
+        hi = int(np.searchsorted(times_ns, t_c_ns + half_ns, side='right'))
+        if hi - lo < c.ROUGH_MIN_PTS:
             continue
-        e = elev_arr[lo_idx:hi_idx]
-        a = azim_arr[lo_idx:hi_idx]
-        elev_center = float(np.median(e))
-        azim_center = float(np.median(a))
-
+        t_rel = (times_ns[lo:hi] - t_c_ns) / 1e9          # seconds, window-centered
+        elev_center = float(np.median(elev_arr[lo:hi]))
+        azim_center = float(np.median(azim_arr[lo:hi]))
         for sig in applicable:
-            res = estimate_rh_signal(
-                e, snr_cols[sig.snr_col][lo_idx:hi_idx], sig,
-                min_pts=c.MIN_WIN_PTS,
-            )
-            if not np.isfinite(res['rh']):
+            snr_db = snr_cols[sig.snr_col][lo:hi]
+            mask = snr_db > 0
+            if mask.sum() < c.ROUGH_MIN_PTS:
+                continue
+            r = _window_roughness(t_rel[mask], 10 ** (snr_db[mask] / 20.0))
+            if not np.isfinite(r):
                 continue
             out.append({
                 't_center_utc':  t_c,
@@ -448,46 +267,33 @@ def rolling_rh_per_arc(arc_long_df: pd.DataFrame,
                 'pass_id':       pass_id,
                 'signal':        sig.name,
                 'snr_col':       sig.snr_col,
-                'n_pts_window':  n_pts,
+                'n_pts_window':  int(mask.sum()),
                 'elev_center':   round(elev_center, 3),
                 'azim_center':   round(azim_center, 2),
-                'rh':            round(float(res['rh']), 4),
-                'sigma':         (round(float(res['sigma_rh']), 4)
-                                  if np.isfinite(res['sigma_rh']) else np.nan),
-                'p2n':           round(float(res['p2n']), 2),
-                'edge_hit':      bool(res['edge_hit']),
+                'roughness':     round(r, 6),
             })
     return pd.DataFrame(out)
 
 
-def process_arcs_windowed(snr_df: pd.DataFrame,
-                           window_sec: float = c.WINDOW_SEC,
-                           stride_sec: float = c.STRIDE_SEC) -> pd.DataFrame:
-    """End-to-end per-day windowed pipeline: segment + rolling-window
-    multi-signal RH estimation + quality gates.
-
-    Returns long-form DataFrame (one row per surviving window×signal). Use
-    this in place of `process_arcs` when you need sub-arc time resolution
-    (rogue waves, fast tide rate-of-change, etc.). Per-arc analysis is
-    still appropriate for tide tracking — both can coexist.
-    """
+def process_arcs_roughness(snr_df: pd.DataFrame,
+                           window_sec: float = c.ROUGH_WIN_SEC,
+                           stride_sec: float = c.ROUGH_STRIDE_SEC) -> pd.DataFrame:
+    """End-to-end per-day roughness: segment arcs + rolling roughness per signal,
+    then add a per-arc calm baseline (median) and the relative `rough_ratio`
+    used by the wave-train detector. Long-form DataFrame."""
     arcs = segment_arcs(snr_df)
     if arcs.empty:
         return pd.DataFrame()
-
-    frames = [rolling_rh_per_arc(g, window_sec=window_sec, stride_sec=stride_sec)
+    frames = [rolling_roughness_per_arc(g, window_sec, stride_sec)
               for _, g in arcs.groupby('arc_id', sort=True)]
     frames = [f for f in frames if not f.empty]
     if not frames:
         return pd.DataFrame()
-
     obs = pd.concat(frames, ignore_index=True)
-
-    # Quality gates: drop windows with low P2N or edge-hit retrievals
-    keep = (obs['p2n'] >= c.P2N_WIN_MIN) & (~obs['edge_hit'])
-    obs = obs[keep].reset_index(drop=True)
-    obs = obs.sort_values(['t_center_utc', 'sat', 'signal']).reset_index(drop=True)
-    return obs
+    # Per-arc calm floor -> relative roughness (a wave train spikes above it).
+    obs['baseline'] = obs.groupby('arc_id')['roughness'].transform('median')
+    obs['rough_ratio'] = obs['roughness'] / obs['baseline'].replace(0, np.nan)
+    return obs.sort_values(['t_center_utc', 'sat', 'signal']).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -495,82 +301,21 @@ def process_arcs_windowed(snr_df: pd.DataFrame,
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    YEAR, DOY = 2026, 1
+    import time as _time
+    YEAR, DOY = 2025, 110            # 1 Hz smoke-test day (must exist in RINEX_DIR)
     print(f'Station {c.STATION}  year {YEAR}  doy {DOY}')
     print(f'snr file: {snr_path(YEAR, DOY)}')
 
-    snr = load_snr(YEAR, DOY)
-    print(f'Loaded {len(snr):,} SNR rows, {len(snr.columns)} columns')
-    print(f'PRN range: {snr.sat.min()}-{snr.sat.max()}  '
-          f'({snr.sat.nunique()} unique sats)')
+    snr_df = load_snr(YEAR, DOY)
+    print(f'Loaded {len(snr_df):,} SNR rows, {len(snr_df.columns)} columns; '
+          f'PRN {snr_df.sat.min()}-{snr_df.sat.max()} ({snr_df.sat.nunique()} sats)')
 
-    arcs = process_arcs(snr)
-    print(f'\nArcs produced: {len(arcs)}')
-    print(f'\nConstellation breakdown:')
-    print(arcs.constellation.value_counts().to_string())
-
-    print(f'\nPer-signal summary (post-P2N + edge-hit gate):')
-    print(f'  {"signal":8s}  {"n":>3s}  {"median RH":>10s}  {"std RH":>8s}  '
-          f'{"med sigma":>10s}  {"edge-hits":>10s}')
-    for sig in c.ENABLED_SIGNALS:
-        rh_col   = f'RH_{sig.name}'
-        sig_col  = f'sigma_{sig.name}'
-        edge_col = f'edge_{sig.name}'
-        if rh_col not in arcs.columns:
-            continue
-        vals = arcs[rh_col].dropna()
-        sigs = arcs[sig_col].dropna()
-        n_edge = int(arcs[edge_col].fillna(False).sum())
-        if len(vals):
-            print(f'  {sig.name:8s}  {len(vals):3d}  {vals.median():10.3f}  '
-                  f'{vals.std():8.3f}  {sigs.median()*100:>8.1f} cm  '
-                  f'{n_edge:10d}')
-        else:
-            print(f'  {sig.name:8s}  no valid retrievals')
-
-    print(f'\nFirst 8 arcs (RH ± sigma in m):')
-    show_cols = ['arc_id', 'sat', 'constellation', 'dir', 'az_mean', 'n_pts',
-                 't_mid_utc']
-    print(arcs[show_cols].head(8).to_string(index=False))
-    for sig in c.ENABLED_SIGNALS:
-        if f'RH_{sig.name}' not in arcs.columns:
-            continue
-        rhs   = arcs[f'RH_{sig.name}'].head(8)
-        sigs  = arcs[f'sigma_{sig.name}'].head(8)
-        line  = f'  {sig.name:8s}: '
-        line += '  '.join(f'{r:6.3f}±{s*100:>4.1f}cm' if pd.notna(r) else '     —     '
-                          for r, s in zip(rhs, sigs))
-        print(line)
-
-    # --- Windowed observation pipeline ---
-    print(f'\n=== Windowed observations '
-          f'(window={c.WINDOW_SEC}s, stride={c.STRIDE_SEC}s) ===')
-    import time as _time
     t0 = _time.perf_counter()
-    obs = process_arcs_windowed(snr)
-    dt = _time.perf_counter() - t0
-    print(f'Built {len(obs):,} windowed obs in {dt:.1f}s')
-    if len(obs):
-        print(f'Time span: {obs.t_center_utc.min()} -> {obs.t_center_utc.max()}')
-        print()
-        print(f'Per-signal counts and median sigma:')
-        for sig in c.ENABLED_SIGNALS:
-            sub = obs[obs.signal == sig.name]
-            if not len(sub):
-                continue
-            print(f'  {sig.name:8s}  n={len(sub):5d}  '
-                  f'median RH={sub.rh.median():.3f}  '
-                  f'median σ={sub.sigma.median()*100:5.1f} cm  '
-                  f'median p2n={sub.p2n.median():.1f}')
-
-    # Demonstrate access to per-sample time series within an arc (needed for
-    # the streaming/Kalman variant: rolling Lomb-Scargle windows).
-    long_df = segment_arcs(snr)
-    print(f'\nLong-form DataFrame from segment_arcs: '
-          f'{len(long_df):,} rows, columns include time_utc')
-    sample_arc = long_df[long_df.arc_id == long_df.arc_id.iloc[0]]
-    print(f'  Sample arc {int(sample_arc.arc_id.iloc[0])} '
-          f'(sat={int(sample_arc.sat.iloc[0])}, dir={sample_arc.dir.iloc[0]}): '
-          f'{len(sample_arc)} points spanning '
-          f'{sample_arc.time_utc.min()} -> {sample_arc.time_utc.max()} '
-          f'({(sample_arc.time_utc.max() - sample_arc.time_utc.min()).total_seconds()/60:.1f} min)')
+    rough = process_arcs_roughness(snr_df)
+    print(f'\nRoughness obs: {len(rough):,} in {_time.perf_counter()-t0:.1f}s')
+    if len(rough):
+        print('  by constellation:', rough.constellation.value_counts().to_dict())
+        print('  rough_ratio: '
+              f'p50={rough.rough_ratio.quantile(.5):.2f}  '
+              f'p99={rough.rough_ratio.quantile(.99):.2f}  '
+              f'max={rough.rough_ratio.max():.2f}')

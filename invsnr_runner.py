@@ -15,6 +15,7 @@ Usage: see `main.USE_INVSNR`. Set True to swap in this wrapper.
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
 from pathlib import Path
 
@@ -23,18 +24,23 @@ import pandas as pd
 
 import config as c
 
-# gnssrefl reads these at import time, so set them before the imports below
-os.environ.setdefault('REFL_CODE', str(c.REFL_CODE))
-os.environ.setdefault('ORBITS',    str(c.ORBITS_DIR))
-os.environ.setdefault('EXE',       str(c.EXE_DIR))
+# gnssrefl reads these at import time, so set them before the imports below.
+# REFL_CODE must be the rate-specific snr66 tree (same as snr.py sets), so invsnr
+# finds the right snr files even if this module is imported/run standalone; set
+# it explicitly (not setdefault). ORBITS/EXE stay shared.
+os.environ['REFL_CODE'] = str(c.SNR_REFL_CODE)
+os.environ.setdefault('ORBITS', str(c.ORBITS_DIR))
+os.environ.setdefault('EXE',    str(c.EXE_DIR))
 
-from gnssrefl.invsnr_cl import invsnr                             # noqa: E402
 from gnssrefl.invsnr_input import invsnr_input                    # noqa: E402
+# NB: gnssrefl.invsnr_cl.invsnr is imported INSIDE the subprocess worker
+# (_invsnr_call) so each spawned, timeout-guarded run is self-contained.
 
 
 # ---------------------------------------------------------------------------
 # Configuration shim — writes the JSON file invsnr reads from $REFL_CODE/input/
 # ---------------------------------------------------------------------------
+
 
 def ensure_config(
     station: str = c.STATION,
@@ -207,6 +213,33 @@ def _contiguous_runs(dates: list[tuple[int, int]]) -> list[list[tuple[int, int]]
     return runs
 
 
+def _invsnr_call(kwargs: dict) -> None:
+    """Subprocess entry point: one gnssrefl invsnr run. Imports invsnr here so
+    the spawn child is self-contained (this module's top-level already set the
+    $REFL_CODE/$ORBITS/$EXE env when the child imported it)."""
+    from gnssrefl.invsnr_cl import invsnr
+    invsnr(**kwargs)
+
+
+def _invsnr_with_timeout(kwargs: dict, timeout: float) -> None:
+    """Run invsnr in a spawned subprocess and kill it if it exceeds `timeout`.
+    gnssrefl's invsnr can spin at 100% CPU on a pathological chunk (~doy 164);
+    isolating it lets us terminate and skip it. Raises TimeoutError on timeout
+    (run_range catches it and falls back to per-day fits, so one bad day is
+    skipped rather than stalling the whole range)."""
+    ctx = mp.get_context('spawn')
+    p = ctx.Process(target=_invsnr_call, args=(kwargs,))
+    p.start()
+    p.join(timeout)
+    if p.is_alive():
+        p.terminate(); p.join(5)
+        if p.is_alive():
+            p.kill(); p.join()
+        raise TimeoutError(f'invsnr exceeded {timeout:.0f}s')
+    if p.exitcode != 0:
+        raise RuntimeError(f'invsnr subprocess exited with code {p.exitcode}')
+
+
 def _fit_chunk(
     year: int,
     fit_first: int,
@@ -221,6 +254,9 @@ def _fit_chunk(
     constel: str | None = None,
     peak2noise: float = 2.5,
     refraction: bool = True,
+    dec: int = c.INVSNR_DEC,        # SNR decimation (s) invsnr applies on read.
+                                    # 15 for 1 Hz so the tide-scale spline isn't
+                                    # fit over 1.1 M points (would hang).
     sigma_estimate_m: float = 0.10,
     outfile_type: str = 'txt',     # 'csv' triggers a format-string bug in
                                     # gnssrefl 4.1.5 (spline_functions L355) —
@@ -244,7 +280,7 @@ def _fit_chunk(
     if out_path.exists():
         out_path.unlink()
 
-    invsnr(
+    _invsnr_with_timeout(dict(
         station=station, year=year, doy=fit_first,
         doy_end=(fit_last if fit_last != fit_first else None),
         signal=signal,
@@ -253,9 +289,10 @@ def _fit_chunk(
         constel=constel,
         peak2noise=peak2noise,
         refraction=refraction,
+        dec=dec,
         plt=False, snrfigs=False, lspfigs=False,
         outfile_type=outfile_type,
-    )
+    ), c.INVSNR_TIMEOUT_SEC)
 
     if not out_path.exists():
         raise RuntimeError(
@@ -412,25 +449,6 @@ def run_range(
     return stitched
 
 
-def run(
-    station: str,
-    year: int,
-    doy_start: int,
-    doy_end: int | None,
-    *,
-    tide_model,
-    force: bool = False,
-    **kwargs,
-) -> pd.DataFrame:
-    """Backwards-compatible single-year wrapper around `run_range`.
-    Days are processed individually with per-day caching."""
-    if doy_end is None:
-        doy_end = doy_start
-    date_filter = {(year, d) for d in range(doy_start, doy_end + 1)}
-    return run_range(date_filter, tide_model=tide_model,
-                     force=force, station=station, **kwargs)
-
-
 # ---------------------------------------------------------------------------
 # Smoke test
 # ---------------------------------------------------------------------------
@@ -438,11 +456,11 @@ def run(
 if __name__ == '__main__':
     from tide import GreenlandTideModel
 
-    YEAR, DOY_START, DOY_END = 2025, 90, 92    # 3-day test
-    print(f'Running invsnr for {c.STATION} {YEAR} doys {DOY_START}-{DOY_END}')
+    YEAR, DOYS = 2025, range(110, 113)    # 3-day test
+    print(f'Running invsnr for {c.STATION} {YEAR} doys {DOYS.start}-{DOYS.stop-1}')
 
     tm = GreenlandTideModel(c.LAT, c.LON)
-    state = run(c.STATION, YEAR, DOY_START, DOY_END, tide_model=tm)
+    state = run_range({(YEAR, d) for d in DOYS}, tide_model=tm)
 
     print(f'\nReturned state: {len(state):,} rows')
     if len(state):
